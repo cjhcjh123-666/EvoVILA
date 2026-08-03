@@ -1,0 +1,32 @@
+# Local environments and editor state
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# Model weights, checkpoints, datasets, and generated outputs
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+checkpoints/
+outputs/
+runs/
+wandb/
+datasets/
+data/cache/
+
+# Local caches and private configuration
+.cache/
+*.log
+.env
+.env.*
+!.env.example
