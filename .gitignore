@@ -23,6 +23,11 @@ runs/
 wandb/
 datasets/
 data/cache/
+generated_masks/
+masks/
+videos/
+experiment_outputs/
+results/
 
 # Local caches and private configuration
 .cache/
