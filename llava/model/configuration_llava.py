@@ -66,6 +66,8 @@ class LlavaConfig(PretrainedConfig):
         time_token_format=None,
         image_encoder: str = '{"_target_": "llava.model.encoders.BasicImageEncoder"}',
         video_encoder: str = '{"_target_": "llava.model.encoders.BasicVideoEncoder"}',
+        capabilities=None,
+        capability_checkpoint=None,
         **kwargs,
     ):
         super().__init__()
@@ -107,6 +109,8 @@ class LlavaConfig(PretrainedConfig):
         self.mm_scale_num = mm_scale_num
         self.num_time_tokens = num_time_tokens
         self.time_token_format = time_token_format
+        self.capabilities = capabilities
+        self.capability_checkpoint = capability_checkpoint
 
         self.image_encoder = image_encoder
         self.video_encoder = video_encoder

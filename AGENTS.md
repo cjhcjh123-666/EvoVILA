@@ -48,5 +48,6 @@ copyright notices, and attribution in copied or modified files.
   policies must remain separately measurable.
 - A future capability router may choose whether to activate dense perception,
   but it must not silently change the default path or erase baseline outputs.
-- Do not implement SAM2, `[SEG]` tokens, segmentation training, or dynamic
-  routing as part of Milestone 0.
+- Do not implement SAM2, `[SEG]` tokens, text-conditioned referring/reasoning
+  segmentation, or dynamic routing as part of the M0-M2 warm-up work. A future
+  training recipe must be added only after the mask data contract is frozen.

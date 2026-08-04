@@ -124,6 +124,7 @@ class LlavaTopDownLlamaModel(LlavaMetaModel, LlavaTopDownMetaForCausalLM, PreTra
         smooth_selection_prob: bool = False,
         gt_selection_maps=None,
         original_image_sizes=None,
+        segmentation_masks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         self.freezed_module_patch()
@@ -214,6 +215,7 @@ class LlavaTopDownLlamaModel(LlavaMetaModel, LlavaTopDownMetaForCausalLM, PreTra
                 top_down_hidden_states, forward_top_down_prompt_head=True
             )  # .to(device)
 
+            self._clear_capability_request()
             return top_down_prompts
         else:
             if inputs_embeds is None:
@@ -234,6 +236,7 @@ class LlavaTopDownLlamaModel(LlavaMetaModel, LlavaTopDownMetaForCausalLM, PreTra
                     smooth_selection_prob=smooth_selection_prob,
                     gt_selection_maps=gt_selection_maps,
                     original_image_sizes=original_image_sizes,
+                    capability_inputs={"segmentation_masks": segmentation_masks},
                 )
 
             if packing and self.training and not dpo_forward:
@@ -275,6 +278,8 @@ class LlavaTopDownLlamaModel(LlavaMetaModel, LlavaTopDownMetaForCausalLM, PreTra
         if get_pg_manager() is not None:
             loss_weight = calculate_loss_weight(labels)
             outputs.loss = outputs.loss * loss_weight
+
+        outputs = self._finalize_capabilities(outputs)
 
         if dpo_forward:
             return outputs.logits, labels

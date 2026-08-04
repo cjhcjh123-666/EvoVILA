@@ -106,6 +106,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
         force_packing: bool = False,
         seqlens_in_batch: Optional[torch.LongTensor] = None,
         dpo_forward: bool = False,
+        segmentation_masks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         self.freezed_module_patch()
@@ -120,7 +121,14 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
             media_config = defaultdict(dict)
 
         if inputs_embeds is None:
-            inputs_embeds, labels, attention_mask = self._embed(input_ids, media, media_config, labels, attention_mask)
+            inputs_embeds, labels, attention_mask = self._embed(
+                input_ids,
+                media,
+                media_config,
+                labels,
+                attention_mask,
+                capability_inputs={"segmentation_masks": segmentation_masks},
+            )
 
         if force_packing or (packing and self.training and not dpo_forward):
             if seqlens_in_batch is None:
@@ -152,6 +160,8 @@ class LlavaLlamaModel(LlavaMetaModel, LlavaMetaForCausalLM, PreTrainedModel):
         if get_pg_manager() is not None:
             loss_weight = calculate_loss_weight(labels)
             outputs.loss = outputs.loss * loss_weight
+
+        outputs = self._finalize_capabilities(outputs)
 
         if dpo_forward:
             return outputs.logits, labels
