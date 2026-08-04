@@ -120,6 +120,16 @@ def _build_image_segmentation_capability(**kwargs) -> Capability:
 DEFAULT_CAPABILITY_REGISTRY.register("image_segmentation", _build_image_segmentation_capability)
 
 
+def _build_video_segmentation_capability(**kwargs) -> Capability:
+    # Keep SAM2 and its Hydra configuration out of ordinary VILA imports.
+    from .video_segmentation import VideoSegmentationCapability
+
+    return VideoSegmentationCapability(**kwargs)
+
+
+DEFAULT_CAPABILITY_REGISTRY.register("video_segmentation", _build_video_segmentation_capability)
+
+
 def build_capability_pipeline(
     request: Any = None,
     *,

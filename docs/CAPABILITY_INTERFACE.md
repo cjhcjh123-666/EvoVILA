@@ -34,6 +34,14 @@ features through `on_vision_features`. It returns `mask_logits` and, when
 Dice loss. This extension is opt-in and does not replace VILA media-token
 fusion.
 
+M3 adds the separate `video_segmentation` capability. Its `segment_videos()`
+entry point accepts a frame directory or MP4 and explicitly runs the local
+SAM2.1 video predictor from anchor-frame point or box prompts. It returns
+binary CPU masks shaped `[T,H,W]` for one object or `[T,N,H,W]` for multiple
+objects. Predictor, anchor, propagation, and total latency are available from
+`return_result=True`. SAM2 remains lazy and is not part of ordinary VILA
+loading.
+
 An extension can be registered for local use without changing VILA's registry:
 
 ```python

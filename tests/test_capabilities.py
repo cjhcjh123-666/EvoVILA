@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import pytest
+import torch
 from torch import nn
 
 from llava.capabilities import (
@@ -198,3 +199,121 @@ def test_model_mixin_segment_images_uses_the_capability_public_entry_point():
     output = Harness().segment_images(torch.zeros(2, 3, 8, 8))
 
     assert output.shape == (2, 1, 5, 7)
+
+
+class FakeVideoPredictor:
+    def __init__(self, num_frames=3, height=4, width=5):
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.prompts = []
+
+    def init_state(self, video_path, **kwargs):
+        assert video_path
+        return {
+            "num_frames": self.num_frames,
+            "video_height": self.height,
+            "video_width": self.width,
+        }
+
+    def add_new_points_or_box(self, **kwargs):
+        self.prompts.append(kwargs)
+        return 0, [kwargs["obj_id"]], torch.ones(1, 1, self.height, self.width)
+
+    def propagate_in_video(self, inference_state):
+        object_ids = [prompt["obj_id"] for prompt in self.prompts]
+        for frame_idx in range(self.num_frames):
+            logits = torch.full(
+                (len(object_ids), 1, self.height, self.width),
+                float(frame_idx + 1),
+            )
+            yield frame_idx, object_ids, logits
+
+
+def test_video_segmentation_is_registered_without_importing_sam2():
+    import sys
+
+    pipeline = build_capability_pipeline("video_segmentation")
+
+    assert pipeline.enabled_names == ("video_segmentation",)
+    assert "sam2" not in sys.modules
+
+
+def test_video_segmentation_normalizes_single_and_multiple_object_outputs(tmp_path):
+    torch = pytest.importorskip("torch")
+    from llava.capabilities.video_segmentation import VideoSegmentationCapability
+
+    video_dir = tmp_path / "frames"
+    video_dir.mkdir()
+    predictor = FakeVideoPredictor()
+    capability = VideoSegmentationCapability(options={"device": "cpu"})
+    capability._build_predictor = lambda device: predictor
+
+    single = capability.segment(
+        video_dir,
+        points=[[2, 2]],
+        labels=[1],
+        return_result=True,
+    )
+    assert single.masks.shape == (3, 4, 5)
+    assert single.masks.dtype == torch.bool
+    assert single.object_ids == (1,)
+    assert single.instrumentation["anchor_frame"] == 0
+    assert single.instrumentation["anchor_latency_s"] >= 0
+    assert single.instrumentation["propagation_latency_s"] >= 0
+    assert single.instrumentation["total_latency_s"] >= single.instrumentation["propagation_latency_s"]
+
+    multi = capability.segment(
+        video_dir,
+        prompts={
+            7: {"points": [[1, 1]], "labels": [1]},
+            9: {"box": [0, 0, 3, 3]},
+        },
+    )
+    assert multi.shape == (3, 2, 4, 5)
+
+
+def test_video_segmentation_reports_missing_sam2_clearly(tmp_path, monkeypatch):
+    from llava.capabilities import video_segmentation
+
+    video_dir = tmp_path / "frames"
+    video_dir.mkdir()
+
+    def missing_sam2():
+        raise video_segmentation.CapabilityError(
+            "video_segmentation requires SAM2. Install the local SAM2 package"
+        )
+
+    monkeypatch.setattr(video_segmentation, "_load_sam2_builder", missing_sam2)
+    capability = video_segmentation.VideoSegmentationCapability(options={"device": "cpu"})
+    with pytest.raises(CapabilityError, match="requires SAM2"):
+        capability.segment(video_dir, points=[[1, 1]], labels=[1])
+
+
+def test_model_mixin_segment_videos_uses_the_capability_public_entry_point(tmp_path):
+    torch = pytest.importorskip("torch")
+    try:
+        from llava.model.llava_arch import LlavaMetaModel
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"full VILA model dependencies are unavailable: {exc}")
+
+    from llava.capabilities.video_segmentation import VideoSegmentationCapability
+
+    class Harness(LlavaMetaModel, nn.Module):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.capabilities = build_capability_pipeline("video_segmentation")
+            self.capability_modules = nn.ModuleList()
+            self._active_capability_context = None
+
+    video_dir = tmp_path / "frames"
+    video_dir.mkdir()
+    model = Harness()
+    capability = next(iter(model.capabilities.capabilities))
+    assert isinstance(capability, VideoSegmentationCapability)
+    capability._build_predictor = lambda device: FakeVideoPredictor()
+
+    output = model.segment_videos(video_dir, points=[[1, 1]], labels=[1])
+
+    assert output.shape == (3, 4, 5)
+    assert model._active_capability_context is None

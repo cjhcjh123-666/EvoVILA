@@ -116,3 +116,58 @@ Assets remain outside Git under `/9950backfile`:
 The SAM2 files are the official SAM2.1 checkpoints. DAVIS is the first M3
 validation target; YouTube-VOS is reserved for the later training and
 retention protocol. No dataset or checkpoint is copied into the repository.
+
+## M3 Video Segmentation Update - 2026-08-04
+
+The M3 implementation adds an opt-in `video_segmentation` capability backed
+by the official SAM2 video predictor. It accepts a JPEG frame directory or
+MP4, supports anchor-frame points/boxes for one or multiple objects, and
+returns CPU boolean masks shaped `[T,H,W]` for one object or `[T,N,H,W]` for
+multiple objects. `return_result=True` additionally exposes object IDs, video
+size, anchor frame, and instrumentation.
+
+SAM2 is not imported by ordinary capability/package initialization. The
+predictor is built only inside an explicit `segment_videos()` request. The
+default local configuration uses:
+
+```text
+SAM2 root: /9950backfile/zhangyafei/sam2
+checkpoint: /9950backfile/zhangyafei/sam2/checkpoints/sam2.1_hiera_tiny.pt
+config: configs/sam2.1/sam2.1_hiera_t.yaml
+```
+
+Focused capability tests pass (`13 passed`). The external-asset command is:
+
+```bash
+PYTHONPATH=/9950backfile/zhangyafei/sam2:/9950backfile/chenjiahui/EvoVILA \
+  /9950backfile/chenjiahui/.conda/envs/evovila/bin/python \
+  scripts/evo/smoke_video_segmentation.py --sequence bear --device cuda
+```
+
+The DAVIS 2017 `bear` validation sequence completed on an NVIDIA A800: 82
+frames, mask shape `[82,480,854]`, mean IoU `0.968115`, predictor latency
+`3.739s`, anchor latency `0.824s`, propagation latency `4.289s`, and total
+latency `16.546s`. SAM2 reported that its optional compiled `_C` post-processing
+extension was unavailable and skipped hole filling; core predictor propagation
+completed successfully, and this warning is retained as a reproducibility
+note.
+
+The ordinary VILA regression also passed with the local VILA1.5-3b checkpoint:
+image caption and 8-frame video caption both completed on the same environment.
+The CLI had a separate default-mode issue: `--conv-mode auto` overwrote the
+model-detected legacy template with AUTO even when the checkpoint had no
+Transformers `chat_template`. `llava/cli/infer.py` now preserves the detected
+template for default/explicit `auto`; an explicit non-auto mode still overrides
+it.
+
+### M3 Running Checks
+
+```bash
+/9950backfile/chenjiahui/.conda/envs/evovila/bin/python -m pytest -q tests -ra
+/9950backfile/chenjiahui/.conda/envs/evovila/bin/python -m py_compile \
+  llava/capabilities/*.py llava/model/llava_arch.py \
+  llava/remote_code/modeling_vila.py scripts/evo/smoke_video_segmentation.py
+EVO_PYTHON=/9950backfile/chenjiahui/.conda/envs/evovila/bin/python \
+  bash scripts/evo/check_repo.sh
+git diff --check
+```

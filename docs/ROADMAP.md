@@ -1,9 +1,9 @@
 # EvoVILA Roadmap
 
 The roadmap is staged so the original VILA capability set can be measured
-before and after every extension. M0, M1, and the M2 image warm-up are active
-in the current branch. Video segmentation and conditional compute remain
-future work.
+before and after every extension. M0, M1, M2, and the M3 video segmentation
+warm-up are active in the current branch. Conditional compute remains future
+work.
 
 ## M0: VILA Audit and Baseline Preservation
 
@@ -70,14 +70,24 @@ are designed.
 
 ## M3: Video Segmentation with SAM2
 
+**Status:** Implemented as an explicit `video_segmentation` capability. The
+branch accepts a frame directory or MP4, applies anchor-frame point/box
+prompts, propagates with the official SAM2.1 video predictor, returns binary
+masks shaped `[T,H,W]` or `[T,N,H,W]`, and records predictor, anchor,
+propagation, and total latency. SAM2 import and predictor construction remain
+lazy, and the default VILA path does not load them.
+
 **Input:** M2 image branch and a versioned video segmentation data contract.
 
 **Output:** An optional video branch with anchor-frame prediction, SAM2
 propagation, and explicit per-component instrumentation.
 
-**Acceptance:** Referring and reasoning video segmentation tests report mask
-quality plus vision, LLM, mask-decoder, and propagation latency/memory; normal
-video QA does not initialize SAM2.
+**Acceptance:** Focused tests cover lazy import, prompt validation, output
+normalization, missing-dependency errors, and both model entry points. A
+SAM2.1 tiny plus DAVIS 2017 `bear` smoke passed on an NVIDIA A800 with 82
+frames, output shape `[82,480,854]`, mean IoU `0.9681`, and separate anchor,
+propagation, and total latency. Referring/reasoning segmentation and full
+vision/LLM/mask-decoder training accounting remain deferred to later stages.
 
 **Main risks:** Temporal identity drift, frame sampling mismatch, propagation
 memory growth, and a hidden dependency in generic model loading.

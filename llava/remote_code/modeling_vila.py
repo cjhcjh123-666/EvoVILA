@@ -311,6 +311,24 @@ class VILAPretrainedModel(PreTrainedModel):
             raise CapabilityError("image_segmentation produced no mask logits")
         return outputs["mask_logits"]
 
+    @torch.inference_mode()
+    def segment_videos(self, video, *, return_result: bool = False, **kwargs):
+        """Run the explicitly enabled SAM2 video branch without an LLM call."""
+        capability = next(
+            (
+                candidate
+                for candidate in getattr(self.capabilities, "capabilities", ())
+                if getattr(candidate, "name", None) == "video_segmentation"
+            ),
+            None,
+        )
+        if capability is None or not hasattr(capability, "segment"):
+            raise CapabilityError("segment_videos requires capabilities=['video_segmentation']")
+        try:
+            return capability.segment(video, return_result=return_result, **kwargs)
+        finally:
+            self._clear_capability_request()
+
     @classmethod
     def convert_vila_dev_ckpt_to_remote(
         self,
