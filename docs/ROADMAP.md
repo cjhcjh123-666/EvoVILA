@@ -1,7 +1,9 @@
 # EvoVILA Roadmap
 
 The roadmap is staged so the original VILA capability set can be measured
-before and after every extension. Only M0 is active in the current branch.
+before and after every extension. M0, M1, and the M2 image warm-up are active
+in the current branch. Video segmentation and conditional compute remain
+future work.
 
 ## M0: VILA Audit and Baseline Preservation
 
@@ -9,8 +11,9 @@ before and after every extension. Only M0 is active in the current branch.
 `long_rl` submodule reference.
 
 **Output:** Repository remotes and development branch are initialized;
-`AGENTS.md`, `docs/PROJECT_SCOPE.md`, `docs/VILA_CODE_MAP.md`, and this
-roadmap document the baseline and extension rules.
+`AGENTS.md`, `docs/PROJECT_SCOPE.md`, `docs/VILA_CODE_MAP.md`, this roadmap,
+`scripts/evo/check_repo.sh`, `configs/evo/README.md`, and
+`docs/BASELINE_PROTOCOL.md` document the baseline and extension rules.
 
 **Acceptance:** `origin` points to EvoVILA, `upstream` points to the original
 VILA repository, the working tree has no weights/data/cache additions, the
@@ -25,11 +28,15 @@ weights are intentionally not downloaded for this audit.
 
 ## M1: Modular Capability-Extension Interface
 
+**Status:** Implemented as an observation-only interface; no segmentation
+implementation is enabled.
+
 **Input:** The M0 call map and baseline smoke tests.
 
-**Output:** A registry/configuration contract for optional capabilities,
-explicit capability selection, and no-op behavior when no extension is
-requested.
+**Output:** `llava.capabilities` provides a registry, explicit request object,
+read-only media context, and no-op pipeline. The normal and remote-code model
+paths notify this pipeline at `_embed` without handing control of media-token
+fusion to an extension. See `docs/CAPABILITY_INTERFACE.md`.
 
 **Acceptance:** Ordinary VILA loading and generation work without optional
 dense dependencies; an extension can receive media context without changing
@@ -41,17 +48,25 @@ ordering, checkpoint compatibility, or distributed dummy calls.
 
 ## M2: Image Segmentation Warm-Up
 
+**Status:** Implemented as an opt-in static-grid mask branch. It consumes
+projected image features and does not condition on language hidden states.
+
 **Input:** M1 interface and image grounding/segmentation training schema.
 
-**Output:** An opt-in image segmentation branch with masks, losses, and
-checkpoint handling separated from the baseline VILA branch.
+**Output:** `image_segmentation` provides a lightweight mask decoder, BCE plus
+Dice loss, an optional `segmentation_masks` batch field, `segment_images()`,
+and a separate `capabilities.bin` checkpoint. The default VILA path remains
+unchanged when the capability is not requested.
 
-**Acceptance:** Referring and reasoning image segmentation smoke tests pass;
-ordinary image QA/captioning outputs remain within the frozen baseline
-tolerance; no SAM2 dependency is required for image-only execution.
+**Acceptance:** Static square visual-token smoke tests cover mask outputs,
+losses, gradients, and explicit activation; ordinary image QA/captioning
+retains the baseline path when the capability is disabled; no SAM2 dependency
+is required for image-only execution.
 
 **Main risks:** Image/text alignment, mask resolution, added memory, and
-unintended gradient flow into frozen VILA modules.
+unintended gradient flow into frozen VILA modules. Full referring/reasoning
+segmentation is deferred until a text-conditioned decoder and data contract
+are designed.
 
 ## M3: Video Segmentation with SAM2
 

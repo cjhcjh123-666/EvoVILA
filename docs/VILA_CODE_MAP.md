@@ -20,6 +20,7 @@ llava.load
        -> build_vision_tower
        -> build_mm_projector
        -> hydra.instantiate(image_encoder/video_encoder)
+       -> build_capability_pipeline (empty unless explicitly configured)
 ```
 
 The model builder is in `llava/model/builder.py:27-156`. It distinguishes a
@@ -195,10 +196,10 @@ implemented by `LLaVATrainer.save_model` around `llava/train/llava_trainer.py:80
 
 | Hook | Current contract | Extension constraint |
 | --- | --- | --- |
-| `LlavaMetaModel.init_vlm` | Builds LLM, vision tower, projector, and encoder registry | Add optional capability modules without making ordinary loading depend on them |
+| `LlavaMetaModel.init_vlm` | Builds LLM, vision tower, projector, encoder registry, and an empty capability pipeline by default | Add optional capability modules without making ordinary loading depend on them |
 | `LlavaMetaModel.encode_images` | Returns projected visual features | Preserve shape/order and baseline outputs when extension is disabled |
 | `BasicImageEncoder` / `BasicVideoEncoder` | Converts projected features to media embedding sequences | Keep media-token consumption and frame ordering stable |
-| `LlavaMetaForCausalLM._embed` | Fuses text and media embeddings and labels | Do not alter default token alignment; use an explicit capability context |
+| `LlavaMetaForCausalLM._embed` | Notifies the optional pipeline, then fuses text and media embeddings and labels | Do not alter default token alignment; capability callbacks receive a read-only context and cannot replace fusion |
 | `LlavaLlamaModel.forward` | Runs the LLM and exposes standard output fields | Add optional outputs without changing ordinary loss/generation behavior |
 | `LlavaMetaForCausalLM.generate_content` | Public multimodal generation path | Keep the default path usable without dense packages |
 | `LlavaConfig` | Stores model, media, and efficiency configuration | Add namespaced optional capability config rather than unrelated global flags |

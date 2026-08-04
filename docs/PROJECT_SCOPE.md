@@ -38,8 +38,9 @@ the original VILA behavior whenever dense perception is unnecessary.
 - Dynamic selection of segmentation anchor frames
 - Dynamic control of SAM2 propagation, memory refresh, and mask refinement
 
-These efficiency capabilities are research targets. They are not implemented
-in Milestone 0.
+These efficiency capabilities are research targets. M0 and M1 provide the
+baseline protection and capability interface; M2 adds only a static image mask
+warm-up and does not implement temporal propagation or conditional compute.
 
 ## Execution Model
 
@@ -56,25 +57,31 @@ The ordinary video path samples frames and either represents them as image
 media or uses the explicit video encoder/data-collator path, depending on the
 entry point and dataset configuration.
 
-The future dense path will be opt-in:
+The dense path is opt-in. M2 uses the following limited form:
 
 ```text
 request capability
     -> select ordinary VILA or dense extension path
     -> reuse VILA visual/text context
-    -> optional mask/temporal branch
-    -> return text plus dense outputs when requested
+    -> optional static image mask branch
+    -> return masks or text plus an auxiliary mask loss
 ```
+
+The M2 decoder consumes projected visual tokens arranged as a square grid. It
+is a vision-only warm-up: it does not yet use referring expressions, reasoning
+hidden states, special segmentation tokens, or temporal propagation.
 
 The default branch must remain valid when no segmentation package is installed.
 
 ## Current Non-Goals
 
-Milestone 0 does not solve or implement:
+M0 through M2 do not solve or implement:
 
 - SAM2 integration or propagation
 - `[SEG]` or other segmentation special tokens
-- Segmentation heads, mask losses, or segmentation training data
+- Text-conditioned referring or reasoning segmentation
+- Segmentation datasets, training recipes, or benchmark claims
+- Dynamic or non-square visual-token mask decoding
 - A capability router or conditional-compute policy
 - Dynamic reasoning-frame or anchor-frame selection
 - Memory refresh or mask-refinement policies
