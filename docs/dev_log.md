@@ -75,3 +75,44 @@ caption smoke also passed after setting the protocol value `config.fps = 0`.
 The stock `vila-infer` CLI currently leaves `config.fps` as `None`, so its
 video path raises a `TypeError` before decoding; this is recorded as an
 upstream baseline CLI issue and is not changed in M0-M2.
+
+## Environment Compatibility Update - 2026-08-04
+
+The authoritative environment now uses a dependency set that satisfies both
+VILA and the PS3/S2 integrations:
+
+```text
+torch==2.4.1+cu121
+torchvision==0.19.1
+triton==3.0.0
+timm==1.0.15
+flash-attn==2.7.4.post1 (PyTorch 2.4, CUDA 12 wheel)
+transformers==4.46.0
+ps3-torch==0.1.3
+s2wrapper==0.1
+```
+
+Torch 2.4.1 declares Triton 3.0.0, and Triton 3.0.0 provides the
+`libdevice` API used by VILA's FP8 kernels. PS3's exact `timm==1.0.15`
+requirement is now the project pin, and the VILA imports used by the standard
+path remain compatible. `pip check` reports no broken requirements.
+
+The video media helper now treats a null `fps` configuration as `0.0`, so the
+stock CLI uses uniform frame sampling when no FPS override is configured.
+
+## External Asset Inventory - 2026-08-04
+
+Assets remain outside Git under `/9950backfile`:
+
+| Asset | Local path | Status |
+| --- | --- | --- |
+| VILA1.5-3b | `/9950backfile/chenjiahui/evo_artifacts/models/VILA1.5-3b/` | 17 files, about 5.9G; HF revision `42d1dda6807cc521ef27674ca2ae157539d17026` |
+| VILA inference demos | `/9950backfile/chenjiahui/evo_artifacts/data/VILA-inference-demos/` | cat image and Sora Tokyo video |
+| SAM2.1 tiny | `/9950backfile/zhangyafei/sam2/checkpoints/sam2.1_hiera_tiny.pt` | SHA256 `7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69` |
+| SAM2.1 base-plus | `/9950backfile/zhangyafei/sam2/checkpoints/sam2.1_hiera_base_plus.pt` | SHA256 `a2345aede8715ab1d5d31b4a509fb160c5a4af1970f199d9054ccfb746c004c5` |
+| DAVIS 2017 | `/9950backfile/zhangyafei/DAVIS-2017/` | about 5.5G; 60 train and 30 validation sequences with JPEG frames and annotations |
+| YouTube-VOS 2019 | `/9950backfile/zhangyafei/YouTubeVOS2019/` | train, valid, test, and test ground-truth archives/metadata are present |
+
+The SAM2 files are the official SAM2.1 checkpoints. DAVIS is the first M3
+validation target; YouTube-VOS is reserved for the later training and
+retention protocol. No dataset or checkpoint is copied into the repository.
