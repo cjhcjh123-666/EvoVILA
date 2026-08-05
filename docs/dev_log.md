@@ -44,6 +44,8 @@
 | S2 boundary tests | `tests/test_evo_seg_sam2_adapter.py` | ✅ Done | 2026-08-05 | 7 passed；全套 53 passed |
 | S2 real provider smoke | `scripts/evo_seg/smoke_sam2_image.py` | ✅ Done | 2026-08-05 | 完成上方 In progress 快照中的 provider gate；完整 VILA 图像链路待验证 |
 | S2 provider regression | `tests/test_evo_seg_sam2_adapter.py` | ✅ Done | 2026-08-05 | 8 个 boundary 测试；全套 54 passed |
+| S2 composed image path | `llava/evo_seg/image_pipeline.py`, `scripts/evo_seg/smoke_image_segmentation.py` | 🚧 In progress | 2026-08-05 | 已找到本地 VILA1.5-3B；先修正显式冻结语义 |
+| S2 image plumbing gate | `llava/evo_seg/image_pipeline.py`, `scripts/evo_seg/smoke_image_segmentation.py` | ✅ Done | 2026-08-05 | 完成上方 In progress 快照；真实 VILA+SAM2 与 retention 通过 |
 
 ## 开发日志
 
@@ -167,6 +169,60 @@
 - **遇到的问题**：pytest 仅报告现有依赖的 17 条 deprecation/future warnings，无测试失败。
 - **解决方案**：回归结果为 54 passed；`py_compile` 与 `git diff --check` 通过。最终 A800 单次 smoke 为初始化 4763.94 ms、encoder 317.05 ms、refinement-with-reencode 345.60 ms、峰值 601.12 MiB；lazy import、finite、frozen 和 state-clear 检查均为 true。
 
+### 2026-08-05 — S2 完整图像链路兼容性审计
+
+- **完成内容**：定位到 Git 外部已有的完整 VILA1.5-3B checkpoint，并在 `evovila` 环境、offline 模式和单张 A800 上通过仓库原生 `llava.load` 完成加载；模型类型为 `LlavaLlamaModel`，LLM hidden size 为 2560，vision input size 为 384。
+- **遇到的问题**：原生 loader 返回 `eval` 模型，但约 31.5 亿 VILA 参数仍为 `requires_grad=True`。现有 adapter 虽使用 `torch.no_grad()`，尚未完整落实需求文档中首阶段冻结 VILA 参数的不变量。
+- **解决方案**：先在显式 `VILASegmentationAdapter` 构造边界冻结并置为 eval，再实现 composed image pipeline 和真实 checkpoint smoke。普通 `llava.load`、`forward`、`generate` 与 `generate_content` 不构造该 adapter，默认路径保持不变。
+
+### 2026-08-05 — 显式 VILA adapter 冻结语义修正
+
+- **完成内容**：`VILASegmentationAdapter` 对显式传入的 `torch.nn.Module` VILA 执行 `eval()` 和 `requires_grad_(False)`；测试模型新增真实参数并检查冻结后权重值不变。
+- **遇到的问题**：无；非 module 的轻量 callable harness 仍保持兼容。
+- **解决方案**：冻结仅发生在扩展 adapter 构造期间，不修改普通 VILA loader 或默认请求路径。
+
+### 2026-08-05 — S2 composed image pipeline 实现
+
+- **完成内容**：新增 `ImageSegmentationOutput` 与 `VILAImageSegmentationPipeline`，在一个显式 image-only 入口内组合 VILA query extraction、SAM2 dense encoding、空间 decoder 和 SAM2 mask refinement；coarse/refined mask 保持独立可检查。
+- **遇到的问题**：dense encoder 与 refiner 若不是同一个 provider，可能产生配置或权重不一致。
+- **解决方案**：构造时要求对象身份一致；disabled、video、T>1 和 batch mismatch 均在执行组件前 fail closed，并提供统一的 request-state 清理入口。
+
+### 2026-08-05 — S2 image pipeline 测试收集修正
+
+- **完成内容**：修正参数化负控测试的参数名称。
+- **遇到的问题**：当前 pytest 配置将 `request` 视为保留 fixture 名，导致测试在收集阶段失败。
+- **解决方案**：改名为 `request_value`，不改变测试场景或实现行为。
+
+### 2026-08-05 — Opt-in CUDA 分组件计时修正
+
+- **完成内容**：在 VILA query、SAM2 image encoder、空间 decoder 和 composed refinement 的计时边界增加对应设备同步。
+- **遇到的问题**：仅用 `perf_counter` 包围异步 CUDA launch 会低估组件耗时，不能用于真实执行路径报告。
+- **解决方案**：同步只存在于显式 segmentation adapter/pipeline；CPU 路径和普通 VILA 请求不增加 CUDA 同步。
+
+### 2026-08-05 — VILA adapter 总计时边界复核
+
+- **完成内容**：移除同步前的冗余 elapsed 赋值，并在 adapter total timer 启动前同步输入设备。
+- **遇到的问题**：独立调用 adapter 时，先前排队的 CUDA 工作可能被计入 extension total。
+- **解决方案**：total 与各组件使用一致的同步起止边界。
+
+### 2026-08-05 — S2 真实 VILA+SAM2 图像 smoke 入口
+
+- **完成内容**：新增 `smoke_image_segmentation.py`，通过外部 CLI 路径 offline 加载 VILA 与 SAM2，构造或读取 RGB image，显式选择唯一 multi-token query span，并运行 composed image pipeline。
+- **遇到的问题**：随机初始化 decoder 的输出只能验证 plumbing；把它当作分割质量结论会误导后续训练判断。
+- **解决方案**：JSON 固定标记 `randomly_initialized_plumbing_only`，同时检查 ordinary VILA 前后 final-token logits 精确一致、VILA/SAM2 冻结、SAM2 状态清理、lazy import、finite shape，并分别记录 VILA vision encoder、LLM、SAM2 encoder、mask decoder 和 refinement 时间；image 路径的 video propagation 显式为 N/A。
+
+### 2026-08-05 — S2 真实图像 plumbing gate 通过
+
+- **完成内容**：在 `evovila` 环境与 A800 上 offline 加载本地 VILA1.5-3B、SAM2.1 Hiera Tiny 和 synthetic RGB image，执行 ordinary VILA baseline、显式 composed image pipeline 与 extension 后 ordinary VILA retention。
+- **遇到的问题**：VILA loader 的 token embedding resize 初始化耗时较长；首次 ordinary forward 还包含 CUDA warm-up，因此不能与后续 steady-state forward 直接比较延迟。
+- **解决方案**：初始化与每个执行组件分开报告。单次结果：VILA 初始化 81132.43 ms、SAM2 初始化 2505.23 ms、VILA query total 60.39 ms（vision encoder 14.31 ms、LLM 22.91 ms）、SAM2 encoder 198.16 ms、mask decoder 157.71 ms、refinement-with-reencode 260.18 ms、pipeline total 701.70 ms、峰值显存 6649.73 MiB。query 的 3 个原始 token 位置 `[46,47,48]` 映射到 fused `[244,245,246]`；dense/coarse/refined shape 分别为 `[1,1,256,64,64]`、`[1,1,1,64,64]`、`[1,1,1,96,128]`。ordinary VILA 前后 logits 完全相同，最大绝对差为 0.0。decoder 仍为随机初始化，本 gate 不评价 mask 质量。
+
+### 2026-08-05 — S2 smoke 生命周期复核
+
+- **完成内容**：真实 smoke 在 pipeline 返回后显式调用统一清理入口，并检查 capability diagnostics 与 SAM2 predictor image state 均已清空。
+- **遇到的问题**：无。
+- **解决方案**：同时要求 SAM2 在 ordinary baseline 前不存在、在显式初始化后存在，使 lazy-import 断言双向闭合。
+
 ## 运行说明
 
 ### 环境准备
@@ -232,3 +288,23 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_sam2_image.py \
 - **参数说明**：`--source-root` 指向 Git 外部的官方 SAM2 checkout；`--checkpoint` 指向已有本地权重；`--device` 是 `CUDA_VISIBLE_DEVICES` 映射后的设备；`--config` 默认使用 `configs/evo_seg/s2_image.yaml`；`--output` 可选且必须位于仓库外。
 - **运行后会发生什么**：显式初始化冻结的 SAM2，构造一张 synthetic RGB image，真实执行 image encoder 与 coarse-mask refinement；不会加载 VILA、下载资产或训练参数。
 - **输出什么**：stdout 输出含 commit/config hash、环境、tensor shape、finite/frozen/state-clear 检查、分组件时间和峰值显存的 JSON。refinement 当前会再次编码图像，因此单独标记为 `sam2_mask_refinement_with_reencode`。
+
+### S2 真实 VILA+SAM2 image pipeline smoke
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_image_segmentation.py \
+  --vila-model /path/to/local/VILA1.5-3b \
+  --sam2-source-root /path/to/local/sam2 \
+  --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+```
+
+- **参数说明**：三个资产参数均要求已有的 Git 外部本地路径；`--image` 可选，省略时使用 deterministic synthetic RGB；`--config` 默认使用 `configs/evo_seg/s2_image.yaml`；`--output` 可选且必须位于仓库外。
+- **运行后会发生什么**：强制 Hugging Face offline 模式，加载冻结 VILA/SAM2，显式提取 multi-token query states，执行 SAM2 dense encoding、随机初始化 spatial decoder 和 SAM2 refinement，并比较 extension 前后 ordinary VILA final-token logits。
+- **输出什么**：stdout 输出 JSON，包含 provenance positions、各 tensor shape、lazy/frozen/finite/state-clear/retention 检查、VILA vision encoder、LLM、SAM2 encoder、mask decoder、refinement 与峰值显存。该 smoke 只批准 plumbing，不批准 mask 质量。
+
+### 2026-08-05 — S2 image plumbing 提交前最终验证
+
+- **完成内容**：在最终工作树重跑全部 EvoVILA-Seg 无权重回归、扩展与 VILA hook/smoke 文件静态编译和 Git 空白检查，并复核第二次真实 VILA+SAM2 image pipeline smoke。
+- **遇到的问题**：pytest 仅报告现有依赖的 17 条 deprecation/future warnings，无测试失败；随机初始化 spatial decoder 仍不具备可评价的 mask 质量。
+- **解决方案**：无权重回归为 61 passed，`py_compile` 与 `git diff --check` 均通过。第二次 A800 smoke 的分项结果为 VILA 初始化 81168.00 ms、SAM2 初始化 2387.58 ms、VILA query total 60.53 ms（vision encoder 14.02 ms、LLM 23.02 ms）、SAM2 image encoder 186.70 ms、mask decoder 37.32 ms、refinement-with-reencode 250.87 ms、pipeline total 555.68 ms、峰值显存 6649.73 MiB。query 原始位置 `[46,47,48]` 映射到 fused `[244,245,246]`；dense/coarse/refined shape 分别为 `[1,1,256,64,64]`、`[1,1,1,64,64]`、`[1,1,1,96,128]`。ordinary VILA retention 精确通过（最大 final-token logit 差 0.0），VILA/SAM2 均冻结，SAM2 lazy import、finite 输出和两类请求状态清理均通过。本次结论仅批准 S2 image plumbing，不批准 mask 质量或训练效果。

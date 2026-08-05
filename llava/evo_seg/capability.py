@@ -7,9 +7,15 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Optional
 
-from torch import nn
+import torch
+from torch import Tensor, nn
 
 from .contracts import GroundingBatch, SegmentationRequest, SegmentationResult, freeze_mapping
+
+
+def _synchronize(tensor: Tensor) -> None:
+    if tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
 
 
 class SegmentationCapability(nn.Module):
@@ -53,8 +59,10 @@ class SegmentationCapability(nn.Module):
         if not isinstance(batch, GroundingBatch):
             raise TypeError("batch must be a GroundingBatch")
 
+        _synchronize(batch.dense_features)
         started = time.perf_counter()
         result = self.decoder(batch)
+        _synchronize(result.mask_logits)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         diagnostics = dict(result.diagnostics)
         component_timing = dict(diagnostics.get("component_timing_ms", {}))

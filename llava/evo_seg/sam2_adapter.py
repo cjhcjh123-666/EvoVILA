@@ -25,6 +25,12 @@ from .contracts import SegmentationRequest, freeze_mapping
 from .vila_adapter import DenseFeatureBatch
 
 
+def _synchronize_device(device_text: str) -> None:
+    device = torch.device(device_text)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
 @dataclass(frozen=True)
 class RGBFrameBatch:
     """Raw RGB pixels for SAM2, represented as ``[B,T,3,H,W]`` CPU uint8."""
@@ -229,6 +235,7 @@ class SAM2ImageFeatureProvider:
         if not isinstance(batch, RGBFrameBatch):
             raise TypeError("batch must be an RGBFrameBatch")
         images, indices = self._valid_images(batch)
+        _synchronize_device(self.options.device)
         started = time.perf_counter()
         with self._lock, torch.no_grad():
             predictor = self._get_predictor_locked()
@@ -237,6 +244,7 @@ class SAM2ImageFeatureProvider:
                 valid_features = self._extract_image_embedding(predictor)
             finally:
                 self._reset_predictor(predictor)
+        _synchronize_device(self.options.device)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if valid_features.shape[0] != len(indices):
             raise RuntimeError("SAM2 image embedding batch does not match the number of valid frames")

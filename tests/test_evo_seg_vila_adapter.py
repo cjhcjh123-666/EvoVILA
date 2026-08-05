@@ -190,12 +190,14 @@ def test_top_down_embed_uses_same_provenance_observer_contract():
     assert capture.provenance.source_position[0].tolist() == [0, -1, -1, 2, 3]
 
 
-class _AdapterModel:
+class _AdapterModel(nn.Module):
     def __init__(self, padding_side="right"):
+        super().__init__()
         self.padding_side = padding_side
         self.calls = []
+        self.offset = nn.Parameter(torch.tensor(0.0))
 
-    def __call__(self, **kwargs):
+    def forward(self, **kwargs):
         self.calls.append(kwargs)
         observer = current_fusion_observer()
         assert observer is not None
@@ -205,7 +207,7 @@ class _AdapterModel:
         ]
         mask = torch.tensor([[True, True, True, True, False], [True, True, True, True, True]])
         observer.observe_fusion(rows, padding_side=self.padding_side, fused_attention_mask=mask)
-        hidden = torch.arange(2 * 5 * 4, dtype=torch.float32).reshape(2, 5, 4)
+        hidden = torch.arange(2 * 5 * 4, dtype=torch.float32).reshape(2, 5, 4) + self.offset
         return SimpleNamespace(hidden_states=(hidden, hidden + 1.0))
 
 
@@ -235,8 +237,12 @@ class _AdapterDecoder(nn.Module):
 
 def test_adapter_extracts_multi_token_states_without_grad_and_segments():
     model = _AdapterModel()
+    original_weight = model.offset.detach().clone()
     provider = _Provider()
     adapter = VILASegmentationAdapter(model, provider, SegmentationCapability(_AdapterDecoder()))
+    assert not model.training
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    assert torch.equal(model.offset, original_weight)
     input_ids = torch.tensor([[10, 11, 99, 12, 13], [20, 21, 98, 22, 23]], dtype=torch.long)
     query_mask = torch.tensor(
         [[True, False, True, False, False], [False, True, False, True, True]], dtype=torch.bool

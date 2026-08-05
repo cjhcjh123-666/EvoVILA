@@ -15,11 +15,16 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from .capability import SegmentationCapability
 from .contracts import GroundingBatch, SegmentationRequest, SegmentationResult, freeze_mapping
 from .provenance import FusionCapture, QueryStateBatch
+
+
+def _synchronize(tensor: Tensor) -> None:
+    if tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,9 @@ class VILASegmentationAdapter:
             raise TypeError("dense_provider must be callable or implement encode")
         if not isinstance(capability, SegmentationCapability):
             raise TypeError("capability must be a SegmentationCapability")
+        if isinstance(model, nn.Module):
+            model.eval()
+            model.requires_grad_(False)
         self.model = model
         self.dense_provider = dense_provider
         self.capability = capability
@@ -153,6 +161,7 @@ class VILASegmentationAdapter:
         if not isinstance(hidden_layer, int):
             raise TypeError("hidden_layer must be an integer")
         capture = FusionCapture()
+        _synchronize(input_ids)
         started = time.perf_counter()
         with torch.no_grad(), fusion_observation(capture):
             outputs = self.model(
@@ -165,7 +174,6 @@ class VILASegmentationAdapter:
                 return_dict=True,
                 use_cache=False,
             )
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
         hidden_states = self._hidden_states(outputs)
         try:
             selected_hidden = hidden_states[hidden_layer]
@@ -173,6 +181,8 @@ class VILASegmentationAdapter:
             raise ValueError(
                 f"hidden_layer {hidden_layer} is outside {len(hidden_states)} returned hidden-state layers"
             ) from error
+        _synchronize(selected_hidden)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         if selected_hidden.shape[:2] != capture.provenance.source_position.shape:
             raise RuntimeError(
                 "VILA hidden-state sequence does not align with fused provenance: "
@@ -215,9 +225,10 @@ class VILASegmentationAdapter:
             dense = encode(media, media_config, request)
         else:
             dense = self.dense_provider(media, media_config, request)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
         if not isinstance(dense, DenseFeatureBatch):
             raise TypeError("dense_provider must return a DenseFeatureBatch")
+        _synchronize(dense.features)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         return dense, elapsed_ms
 
     def segment(
@@ -238,6 +249,7 @@ class VILASegmentationAdapter:
             raise ValueError("segmentation capability is disabled for this request")
         if normalized.task not in ("image", "video"):
             raise ValueError("enabled segmentation request requires image or video task")
+        _synchronize(input_ids)
         started = time.perf_counter()
         query_states, vila_ms = self._extract_query_states_with_timing(
             input_ids,
@@ -260,6 +272,7 @@ class VILASegmentationAdapter:
             frame_mask=dense.frame_mask,
         )
         result = self.capability(batch, normalized)
+        _synchronize(result.mask_logits)
         total_ms = (time.perf_counter() - started) * 1000.0
         diagnostics = dict(result.diagnostics)
         component_timing = dict(diagnostics.get("component_timing_ms", {}))

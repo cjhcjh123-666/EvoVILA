@@ -1,6 +1,6 @@
 # Implementation Guide - EvoVILA-Seg Spatiotemporal Segmentation
 
-> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_PROVIDER_COMPLETE; S2_END_TO_END_PENDING; S3-S4 DEFERRED
+> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IMAGE_PLUMBING_COMPLETE; S3-S4 DEFERRED
 > Basis: user-confirmed architecture and repository audit. A formal `docs/idea_report.md` Part 3 does not yet exist, so benchmark-scale training remains outside this implementation milestone.
 
 ## 1 Original Project And Scope
@@ -16,9 +16,11 @@ segmentation-only fork. The implementation is divided into five gates:
 | S3 | Predicted-anchor video propagation | Public opt-in entry point | Existing local video assets |
 | S4 | Image/video training and retention evaluation | Training adapters only initially | External datasets, separately approved |
 
-S0-S1 and the independent S2 provider boundary are complete. The remaining
-gates are specified so that the frozen contracts do not need to be rewritten,
-but benchmark-scale training is not authorized by this document.
+S0-S1 and the S2 image plumbing are complete, including a local VILA1.5-3B plus
+SAM2 real-checkpoint smoke. The S2 decoder remains randomly initialized, so no
+mask-quality claim is made. The remaining gates are specified so that the
+frozen contracts do not need to be rewritten, but benchmark-scale training is
+not authorized by this document.
 
 ## 2 Proposed Repository Structure
 
@@ -39,6 +41,7 @@ llava/
     ├── provenance.py
     ├── vila_adapter.py
     ├── sam2_adapter.py
+    ├── image_pipeline.py
     └── training.py
 tests/
 ├── test_evo_seg_contracts.py
@@ -48,6 +51,7 @@ tests/
 ├── test_evo_seg_provenance.py
 ├── test_evo_seg_vila_adapter.py
 ├── test_evo_seg_sam2_adapter.py
+├── test_evo_seg_image_pipeline.py
 └── test_evo_seg_baseline.py
 scripts/
 └── evo_seg/
@@ -79,6 +83,7 @@ configs/
 | `llava/evo_seg/vila_adapter.py` | Run frozen VILA teacher forcing and connect an injected dense provider to S0 capability | tokenized VILA inputs and query spans | segmentation result | S1 |
 | `llava/model/llava_arch.py` | Add one inactive observer notification inside both repository-native `_embed` paths | current fusion scope | unchanged return tuples | S1 |
 | `llava/evo_seg/sam2_adapter.py` | Lazy dense encoding, refinement, and mask-prompt propagation | RGB frames and anchor masks | SAM2 features/refined tubes | S2/S3 |
+| `llava/evo_seg/image_pipeline.py` | Compose the opt-in VILA adapter, spatial decoder result, and SAM2 image refinement | tokenized VILA media/query plus raw RGB | coarse and refined image masks | S2 |
 | `llava/evo_seg/training.py` | Freeze policy and optimizer parameter selection | VILA, decoder, optional SAM2 | checked parameter groups | S4 |
 | `tests/test_evo_seg_contracts.py` | Reject malformed requests/batches/results and cover T=1/T>1 | synthetic tensors | pass/fail | S0 |
 | `tests/test_evo_seg_decoder.py` | Check shapes, invalid frames, gradients, and query sensitivity | synthetic tensors | pass/fail | S0 |
@@ -87,6 +92,7 @@ configs/
 | `tests/test_evo_seg_provenance.py` | Check text/media expansion, left/right padding, truncation, and query gathering | fake fused rows/hidden states | pass/fail | S1 |
 | `tests/test_evo_seg_vila_adapter.py` | Check frozen teacher forcing, multi-token extraction, dense provider bridge, and default isolation | no-weight VILA harness | pass/fail | S1 |
 | `tests/test_evo_seg_sam2_adapter.py` | Check raw RGB validation, lazy local build, frozen encoder, padding reconstruction, and mask refinement | fake official predictor API | pass/fail | S2 |
+| `tests/test_evo_seg_image_pipeline.py` | Check composed image output, explicit opt-in, T=1 enforcement, state cleanup, and import isolation | fake VILA/SAM2 harness | pass/fail | S2 |
 | `tests/test_evo_seg_baseline.py` | Check original text/image/multi-image/video contracts with extension disabled | draft media wrappers | pass/fail | S0 |
 | `scripts/evo_seg/smoke_decoder.py` | Reproducible no-weight S0 smoke entry point | CLI dimensions/seed/output path | JSON outside Git | S0 |
 | `scripts/evo_seg/smoke_sam2_image.py` | Exercise the real frozen SAM2 encoder/refinement provider without VILA weights | config plus local SAM2 source/checkpoint paths | JSON outside Git or stdout | S2 |
@@ -291,7 +297,26 @@ claiming decoder-only latency.
 **`propagate_anchor_mask(video, anchor_index, anchor_mask) -> Tensor`** calls
 the official SAM2 video predictor's mask-prompt path and returns `[T,H,W]`.
 
-### 5.6 Narrow VILA Integration - S1
+### 5.6 `llava/evo_seg/image_pipeline.py` - S2
+
+This module is imported only by an explicit image-segmentation caller. It does
+not import the external `sam2` package at module load time.
+
+**`ImageSegmentationOutput`** contains the validated coarse
+`SegmentationResult`, refined mask logits `[B,N,1,Hrgb,Wrgb]`, and immutable
+pipeline diagnostics. It rejects non-finite tensors, shape mismatches, or
+refined values on invalid frames.
+
+**`VILAImageSegmentationPipeline(adapter, refiner)`** requires the adapter's
+dense provider and the SAM2 refiner to be the same request-local provider. Its
+**`segment(...) -> ImageSegmentationOutput`** rejects disabled, video, or
+multi-frame requests before executing VILA or SAM2; calls the existing VILA
+adapter with raw RGB supplied only through `dense_input`; refines the predicted
+coarse mask without point/box/human prompts; and reports total plus refinement
+time. **`clear_request_state()`** clears capability diagnostics and any
+predictor-side image state without unloading weights.
+
+### 5.7 Narrow VILA Integration - S1
 
 S1 adds request-local feature extraction around the repository-native VILA
 model. Ordinary `forward`, `generate`, and `generate_content` signatures and
@@ -337,8 +362,10 @@ use a fake provider and S2 later implements the real lazy SAM2 provider.
 media_config, query_token_mask, attention_mask=None, hidden_layer=-1) ->
 QueryStateBatch`** enters a fusion observation scope and calls frozen VILA
 teacher forcing with `packing=False`, `output_hidden_states=True`,
-`return_dict=True`, and `use_cache=False`. It never registers `[SEG]`, changes
-VILA parameters, or reduces the selected expression to one token.
+`return_dict=True`, and `use_cache=False`. Constructing this explicit adapter
+puts a `torch.nn.Module` VILA model in eval mode and sets all of its parameters
+to `requires_grad=False`; it does not change weight values, register `[SEG]`,
+or reduce the selected expression to one token.
 
 **`VILASegmentationAdapter.segment(input_ids, media, media_config,
 query_token_mask, request, attention_mask=None, dense_input=None) ->
@@ -348,7 +375,7 @@ dense provider, builds `GroundingBatch`, calls `SegmentationCapability`, and
 records VILA query, dense provider, decoder, and total time separately.
 `dense_input` keeps raw SAM2 RGB pixels separate from VILA-preprocessed media.
 
-### 5.7 S0 Tests, Configuration, And Smoke Entry Point
+### 5.8 Tests, Configuration, And Smoke Entry Points
 
 **`tests/test_evo_seg_contracts.py`** constructs image (`T=1`) and padded video
 batches, checks recursive request-option immutability, and asserts each invalid
@@ -393,6 +420,16 @@ checks lazy import, finite features/masks, predictor state cleanup, and frozen
 parameters, while reporting initialization, encoder, refinement-with-reencode,
 and peak CUDA memory separately. It does not load VILA weights and therefore
 does not by itself approve the full S2 image segmentation path.
+
+**`scripts/evo_seg/smoke_image_segmentation.py`** requires explicit local VILA
+model, SAM2 source, and SAM2 checkpoint paths. It constructs one deterministic
+RGB image and a unique multi-token referring expression, preprocesses the same
+image independently for VILA and SAM2, and runs the composed public image
+pipeline. Before and after the extension call it executes the ordinary frozen
+VILA path on the same inputs and requires identical final-token logits. The
+JSON report distinguishes model initialization, VILA query encoding, SAM2
+encoding, decoder, refinement-with-reencode, total time, and peak CUDA memory;
+randomly initialized decoder masks are plumbing results, not quality claims.
 
 ## 6 Freeze And Optimizer Policy
 
@@ -464,7 +501,7 @@ task metric deltas.
 5. Run the complete no-weight suite, `py_compile`, and `git diff --check`.
 6. Review S0 before adding any VILA-core hook.
 7. Implement S1 provenance and local VILA wrapper. (complete)
-8. Implement S2 lazy SAM2 image adapter. (provider boundary and real-asset smoke complete; full VILA image path pending)
+8. Implement S2 lazy SAM2 image adapter and complete real VILA+SAM2 image plumbing smoke. (complete; decoder untrained)
 9. Implement S3 predicted-anchor video propagation.
 10. Design and separately approve S4 real-data training.
 
