@@ -11,3 +11,7 @@ request:
 
 input:
   image_path: null
+  synthetic_height: 96
+  synthetic_width: 128
+
+seed: 123

@@ -177,6 +177,12 @@ class SAM2ImageFeatureProvider:
     def initialized(self) -> bool:
         return self._predictor is not None
 
+    def initialize(self) -> None:
+        """Explicitly build frozen SAM2 weights without setting request images."""
+
+        with self._lock, torch.no_grad():
+            self._get_predictor_locked()
+
     def _get_predictor_locked(self) -> Any:
         if self._predictor is None:
             factory = self._predictor_factory or build_sam2_image_predictor

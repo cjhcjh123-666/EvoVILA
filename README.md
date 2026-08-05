@@ -16,14 +16,20 @@ SAM2-free tensor contracts, query-conditioned spatial decoder, losses, and
 no-weight smoke tests. S1 adds frozen multi-token VILA query extraction through
 an inactive-by-default fusion observer and an opt-in adapter. Ordinary VILA
 requests do not import or execute the segmentation package, dense provider, or
-SAM2. S2 now contains a local-only lazy SAM2 image provider boundary, but the
-real checkpoint smoke is pending a compatible external SAM2 installation and
-checkpoint. Video propagation and model fine-tuning remain deferred.
+SAM2. The local-only lazy SAM2 image provider and mask refinement boundary have
+now passed a real-checkpoint smoke in the existing `evovila` environment by
+loading an external SAM2 source tree explicitly. The complete
+VILA+decoder+SAM2 image path still needs a real VILA checkpoint smoke. Video
+propagation and model fine-tuning remain deferred.
 
 ```bash
 conda activate /9950backfile/chenjiahui/.conda/envs/evovila
 python -m pytest -q tests/test_evo_seg_*.py
 python scripts/evo_seg/smoke_decoder.py
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_sam2_image.py \
+  --source-root /path/to/local/sam2 \
+  --checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
 ```
 
 See `docs/implementation.md` for the gated S0-S4 implementation plan and

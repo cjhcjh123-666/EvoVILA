@@ -42,6 +42,8 @@
 | S1 integration tests | `tests/test_evo_seg_vila_adapter.py` | ✅ Done | 2026-08-05 | 9 passed；全套 45 passed |
 | S2 RGB/SAM2 boundary | `llava/evo_seg/sam2_adapter.py` | 🚧 In progress | 2026-08-05 | lazy local build；真实资产 smoke 待完成 |
 | S2 boundary tests | `tests/test_evo_seg_sam2_adapter.py` | ✅ Done | 2026-08-05 | 7 passed；全套 53 passed |
+| S2 real provider smoke | `scripts/evo_seg/smoke_sam2_image.py` | ✅ Done | 2026-08-05 | 完成上方 In progress 快照中的 provider gate；完整 VILA 图像链路待验证 |
+| S2 provider regression | `tests/test_evo_seg_sam2_adapter.py` | ✅ Done | 2026-08-05 | 8 个 boundary 测试；全套 54 passed |
 
 ## 开发日志
 
@@ -153,6 +155,18 @@
 - **遇到的问题**：无；SAM2 默认 builder 在本地源码缺失时 fail closed，且失败前不会导入 SAM2。
 - **解决方案**：`python -m pytest -q tests/test_evo_seg_*.py` 为 53 passed；仍未下载权重或数据。
 
+### 2026-08-05 — S2 真实 SAM2 provider smoke 完成
+
+- **完成内容**：发现机器上已有独立 SAM2 环境、官方源码和 tiny checkpoint；新增 `SAM2ImageFeatureProvider.initialize()` 与真实 CUDA smoke，分别测量模型初始化、图像编码、带重编码的掩码细化和峰值显存。所有源码和 checkpoint 均通过 CLI 从 Git 外部传入。
+- **遇到的问题**：先前认为 `evovila` 环境缺少可用 SAM2；进一步检查发现虽然该环境未安装 SAM2 包，但可从现有本地源码树惰性加载，且无需升级其 PyTorch。独立 SAM2 环境缺少 VILA 的 `transformers`、`deepspeed` 等依赖，只适合 provider 隔离验证。
+- **解决方案**：在 `evovila` 环境和独立 SAM2 环境分别执行同一真实 provider smoke，均通过。`evovila`/A800 单次结果为初始化 6842.09 ms、encoder 358.69 ms、refinement-with-reencode 800.69 ms、峰值 601.12 MiB；独立 SAM2 环境单次结果为 7178.49/401.75/352.12 ms。输出特征为 `[1,1,256,64,64]`，refined mask 为 `[1,1,1,96,128]`，数值有限、SAM2 全冻结、请求状态已清理。该结论完成 S2 provider gate，但完整 VILA+decoder+SAM2 链路仍需真实 VILA checkpoint smoke。
+
+### 2026-08-05 — S2 provider 提交前验证
+
+- **完成内容**：在最终工作树上运行全部 EvoVILA-Seg 无权重回归、静态编译、Git 空白检查和真实 SAM2 provider smoke。
+- **遇到的问题**：pytest 仅报告现有依赖的 17 条 deprecation/future warnings，无测试失败。
+- **解决方案**：回归结果为 54 passed；`py_compile` 与 `git diff --check` 通过。最终 A800 单次 smoke 为初始化 4763.94 ms、encoder 317.05 ms、refinement-with-reencode 345.60 ms、峰值 601.12 MiB；lazy import、finite、frozen 和 state-clear 检查均为 true。
+
 ## 运行说明
 
 ### 环境准备
@@ -204,4 +218,17 @@ python -m py_compile llava/evo_seg/sam2_adapter.py
 
 - **参数说明**：使用 fake predictor；`configs/evo_seg/s2_image.yaml` 中的源码、checkpoint 和图像路径保持为空，真实运行时必须由仓库外路径覆盖。
 - **运行后会发生什么**：验证 raw RGB、lazy build、encoder freeze、无效帧清零、predictor 状态清理和 mask-prompt refinement。
-- **输出什么**：7 个 boundary 测试；不会安装/import SAM2，也不会产生模型或图像文件。
+- **输出什么**：8 个 boundary 测试；不会安装/import SAM2，也不会产生模型或图像文件。
+
+### S2 真实 SAM2 image provider smoke
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_sam2_image.py \
+  --source-root /path/to/local/sam2 \
+  --checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+```
+
+- **参数说明**：`--source-root` 指向 Git 外部的官方 SAM2 checkout；`--checkpoint` 指向已有本地权重；`--device` 是 `CUDA_VISIBLE_DEVICES` 映射后的设备；`--config` 默认使用 `configs/evo_seg/s2_image.yaml`；`--output` 可选且必须位于仓库外。
+- **运行后会发生什么**：显式初始化冻结的 SAM2，构造一张 synthetic RGB image，真实执行 image encoder 与 coarse-mask refinement；不会加载 VILA、下载资产或训练参数。
+- **输出什么**：stdout 输出含 commit/config hash、环境、tensor shape、finite/frozen/state-clear 检查、分组件时间和峰值显存的 JSON。refinement 当前会再次编码图像，因此单独标记为 `sam2_mask_refinement_with_reencode`。

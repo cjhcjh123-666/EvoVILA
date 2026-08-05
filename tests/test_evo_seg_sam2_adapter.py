@@ -114,6 +114,22 @@ def test_provider_is_lazy_freezes_model_and_reconstructs_padding():
     assert dense.diagnostics["preprocessing"] == "SAM2ImagePredictor.set_image_batch"
 
 
+def test_explicit_initialize_builds_frozen_model_without_request_state():
+    predictor = _FakePredictor()
+    calls = []
+    provider = SAM2ImageFeatureProvider(
+        _options(),
+        predictor_factory=lambda options: calls.append(options) or predictor,
+    )
+    provider.initialize()
+    provider.initialize()
+    assert provider.initialized
+    assert len(calls) == 1
+    assert predictor.set_calls == 0
+    assert predictor._features is None
+    assert not any(parameter.requires_grad for parameter in predictor.model.parameters())
+
+
 def test_provider_refines_anchor_logits_and_zeros_invalid_frames():
     predictor = _FakePredictor()
     provider = SAM2ImageFeatureProvider(_options(), predictor_factory=lambda _options: predictor)

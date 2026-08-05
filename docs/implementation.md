@@ -1,6 +1,6 @@
 # Implementation Guide - EvoVILA-Seg Spatiotemporal Segmentation
 
-> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IN_PROGRESS; S3-S4 DEFERRED
+> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_PROVIDER_COMPLETE; S2_END_TO_END_PENDING; S3-S4 DEFERRED
 > Basis: user-confirmed architecture and repository audit. A formal `docs/idea_report.md` Part 3 does not yet exist, so benchmark-scale training remains outside this implementation milestone.
 
 ## 1 Original Project And Scope
@@ -16,9 +16,9 @@ segmentation-only fork. The implementation is divided into five gates:
 | S3 | Predicted-anchor video propagation | Public opt-in entry point | Existing local video assets |
 | S4 | Image/video training and retention evaluation | Training adapters only initially | External datasets, separately approved |
 
-S0 is the first coding milestone. S1-S4 are specified now so that S0 contracts
-do not need to be rewritten later, but they are not authorized as formal
-training runs by this document.
+S0-S1 and the independent S2 provider boundary are complete. The remaining
+gates are specified so that the frozen contracts do not need to be rewritten,
+but benchmark-scale training is not authorized by this document.
 
 ## 2 Proposed Repository Structure
 
@@ -52,6 +52,7 @@ tests/
 scripts/
 └── evo_seg/
     ├── smoke_decoder.py
+    ├── smoke_sam2_image.py
     ├── smoke_image_segmentation.py
     └── smoke_video_segmentation.py
 configs/
@@ -88,6 +89,7 @@ configs/
 | `tests/test_evo_seg_sam2_adapter.py` | Check raw RGB validation, lazy local build, frozen encoder, padding reconstruction, and mask refinement | fake official predictor API | pass/fail | S2 |
 | `tests/test_evo_seg_baseline.py` | Check original text/image/multi-image/video contracts with extension disabled | draft media wrappers | pass/fail | S0 |
 | `scripts/evo_seg/smoke_decoder.py` | Reproducible no-weight S0 smoke entry point | CLI dimensions/seed/output path | JSON outside Git | S0 |
+| `scripts/evo_seg/smoke_sam2_image.py` | Exercise the real frozen SAM2 encoder/refinement provider without VILA weights | config plus local SAM2 source/checkpoint paths | JSON outside Git or stdout | S2 |
 | `scripts/evo_seg/smoke_image_segmentation.py` | Exercise the real opt-in image path | config and local asset paths | JSON outside Git | S2 |
 | `scripts/evo_seg/smoke_video_segmentation.py` | Exercise predicted-anchor propagation | config and local asset paths | JSON outside Git | S3 |
 | `configs/evo_seg/s0_decoder.yaml` | Record default synthetic smoke dimensions and seed | configuration | decoder smoke settings | S0 |
@@ -269,6 +271,11 @@ validates a local official source tree, package-relative config, explicit local
 checkpoint, and device. It never accepts a remote model ID or downloads an
 asset. The returned model is put in eval mode and all parameters are frozen.
 
+**`SAM2ImageFeatureProvider.initialize() -> None`** explicitly builds the
+frozen predictor without setting request images. Ordinary requests never call
+this method; the real-provider smoke uses it to separate model initialization
+from image encoder timing.
+
 **`SAM2ImageFeatureProvider.encode_frames(batch) -> DenseFeatureBatch`** calls
 the official `set_image_batch`, reads `image_embed [N,C,H,W]`, reconstructs
 `[B,T,C,H,W]`, zeroes invalid frames, clones the result, and immediately clears
@@ -277,6 +284,9 @@ predictor image state under a lock.
 **`SAM2ImageFeatureProvider.refine_masks(batch, coarse_masks) -> Tensor`**
 resizes decoder logits to SAM2's mask-prompt size and calls `predict_batch`
 without point/box/human prompts. The returned shape is `[B,N,T,Hrgb,Wrgb]`.
+The current image predictor API re-encodes the RGB image during refinement, so
+the smoke reports this time as `sam2_mask_refinement_with_reencode` rather than
+claiming decoder-only latency.
 
 **`propagate_anchor_mask(video, anchor_index, anchor_mask) -> Tensor`** calls
 the official SAM2 video predictor's mask-prompt path and returns `[T,H,W]`.
@@ -376,6 +386,14 @@ backward passes through the public capability entry point, and writes the
 Section 9 `smoke.json` schema only when an explicit output path outside the
 repository is supplied. Without an output path it prints the JSON to stdout.
 
+**`scripts/evo_seg/smoke_sam2_image.py`** requires explicit local source and
+checkpoint CLI paths, constructs one deterministic synthetic RGB image, and
+executes the real frozen SAM2 image encoder plus coarse-mask refinement. It
+checks lazy import, finite features/masks, predictor state cleanup, and frozen
+parameters, while reporting initialization, encoder, refinement-with-reencode,
+and peak CUDA memory separately. It does not load VILA weights and therefore
+does not by itself approve the full S2 image segmentation path.
+
 ## 6 Freeze And Optimizer Policy
 
 S0 trains only `QueryConditionedSpatialDecoder`. S1/S2 initially freeze the
@@ -393,7 +411,7 @@ linear output and immutable base weights.
 |---|---|
 | S0 | Original text/image/multi-image/video prompt contracts; T=1/T>1 shapes; invalid-frame masking; gradients only in decoder; query-swap loss; no SAM2 import |
 | S1 | correct query spans after media expansion/padding; text/single-image/multi-image/video baseline smoke unchanged |
-| S2 | SAM2 lazy import; raw-image preprocessing metadata; frozen encoder; differentiable decoder output |
+| S2 | SAM2 lazy import; raw-image preprocessing metadata; frozen encoder; predictor state cleanup; real local-source encoder/refinement smoke; differentiable decoder output |
 | S3 | predicted mask accepted as video anchor; `[T,H,W]` output; separate encoder/decoder/propagation timing |
 | S4 | same-image different-target generalization, no-object false positives, image IoU/Dice, video J/F, capability retention |
 
@@ -446,7 +464,7 @@ task metric deltas.
 5. Run the complete no-weight suite, `py_compile`, and `git diff --check`.
 6. Review S0 before adding any VILA-core hook.
 7. Implement S1 provenance and local VILA wrapper. (complete)
-8. Implement S2 lazy SAM2 image adapter. (boundary complete; real-asset smoke pending)
+8. Implement S2 lazy SAM2 image adapter. (provider boundary and real-asset smoke complete; full VILA image path pending)
 9. Implement S3 predicted-anchor video propagation.
 10. Design and separately approve S4 real-data training.
 
