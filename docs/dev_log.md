@@ -308,3 +308,59 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_image_segmentation.py \
 - **完成内容**：在最终工作树重跑全部 EvoVILA-Seg 无权重回归、扩展与 VILA hook/smoke 文件静态编译和 Git 空白检查，并复核第二次真实 VILA+SAM2 image pipeline smoke。
 - **遇到的问题**：pytest 仅报告现有依赖的 17 条 deprecation/future warnings，无测试失败；随机初始化 spatial decoder 仍不具备可评价的 mask 质量。
 - **解决方案**：无权重回归为 61 passed，`py_compile` 与 `git diff --check` 均通过。第二次 A800 smoke 的分项结果为 VILA 初始化 81168.00 ms、SAM2 初始化 2387.58 ms、VILA query total 60.53 ms（vision encoder 14.02 ms、LLM 23.02 ms）、SAM2 image encoder 186.70 ms、mask decoder 37.32 ms、refinement-with-reencode 250.87 ms、pipeline total 555.68 ms、峰值显存 6649.73 MiB。query 原始位置 `[46,47,48]` 映射到 fused `[244,245,246]`；dense/coarse/refined shape 分别为 `[1,1,256,64,64]`、`[1,1,1,64,64]`、`[1,1,1,96,128]`。ordinary VILA retention 精确通过（最大 final-token logit 差 0.0），VILA/SAM2 均冻结，SAM2 lazy import、finite 输出和两类请求状态清理均通过。本次结论仅批准 S2 image plumbing，不批准 mask 质量或训练效果。
+
+### 2026-08-05 — S3 predicted-anchor 视频传播设计冻结
+
+- **完成内容**：审计本机官方 SAM2.1 `build_sam2_video_predictor`、`init_state`、`add_new_mask`、正反向 `propagate_in_video` 和 `reset_state` API；将 S3 收敛为固定 predicted-anchor 推理契约。
+- **遇到的问题**：原实现指南只写了 `[T,H,W]` 单样本占位签名，没有定义 anchor 选择、batch/padding、多对象顺序、反向传播、官方 path-only 视频输入桥接或异常清理；若让 decoder 对所有帧预测后再取 anchor，也会产生不必要的 dense encoding。
+- **解决方案**：VILA 继续观察完整视频，dense provider 和空间 decoder 只处理每个样本的一个 anchor 帧；默认第一个有效帧，也允许显式有效索引，动态选择延后。预测 logits 在零阈值处二值化后作为唯一 SAM2 mask prompt，按样本建立 request-local state 并在需要时双向传播，重建 `[B,N,T,H,W]` 且 padding 为零。S3 专用 builder 让 image wrapper 与 video predictor 共享同一冻结 SAM2 权重；官方 path-only 输入通过自动删除的临时 JPEG 目录桥接，并分开记录 I/O、初始化、prompt 和传播时间。S3 仍为随机 decoder plumbing，不启动训练或评价 mask 质量。
+
+### 2026-08-05 — S3 propagator 与 video pipeline 实现
+
+- **完成内容**：`sam2_adapter.py` 新增视频传播选项/结果契约、video-capable image predictor builder 和共享权重 `SAM2VideoMaskPropagator`；新增 `video_pipeline.py`，组合完整 VILA 视频 query、单 anchor dense decoding 与 SAM2 双向传播。
+- **遇到的问题**：官方 video predictor 只接收 MP4 bytes 或 JPEG 目录，且返回对象顺序和 compact frame index，需要在恢复 padded batch 前显式校验；传播异常时仍必须清除 predictor state 和临时文件。
+- **解决方案**：逐样本将有效 RGB 帧写入自动删除的临时 JPEG 目录，将 source/compact frame index 双向映射，并严格校验对象 ID、返回 shape 和所有有效帧覆盖。所有 state 都在 `finally` 中先 `reset_state` 再清空；pipeline 在执行组件前拒绝 disabled/image/T=1/无效 anchor 请求。两个新实现文件已通过 `py_compile` 和 `git diff --check`。
+
+### 2026-08-05 — S3 无权重传播回归完成
+
+- **完成内容**：新增 `s3_video.yaml` 和 11 个 video pipeline/propagator 测试，覆盖默认/显式 anchor、单 anchor dense encoding、multi-object 顺序恢复、padded batch、正反向传播、共享 provider、video builder 冻结、lazy import 与异常清理。
+- **遇到的问题**：无；fake video predictor 刻意以反向 object ID 顺序返回，并在故障用例中从 generator 内抛错，以验证适配层不是依赖理想返回顺序或成功路径才清理。
+- **解决方案**：`python -m pytest -q tests/test_evo_seg_video_pipeline.py` 为 11 passed；所有 predictor state 字典被清空，request-local 临时目录均已删除，invalid/disabled 请求未执行 VILA 或 SAM2。
+
+### 2026-08-05 — S3 image/video adapter 边界拆分
+
+- **完成内容**：将 S3 video builder、传播选项/结果契约和 propagator 从 `sam2_adapter.py` 移入独立 `sam2_video_adapter.py`；video pipeline、测试和 smoke 改为只在显式视频入口导入它。
+- **遇到的问题**：初版虽然不影响 ordinary VILA，但 S2 image pipeline 导入 `sam2_adapter.py` 时也会解析所有视频临时 I/O 和传播定义，使图像/视频能力边界不够清晰。
+- **解决方案**：`sam2_adapter.py` 恢复为纯 S2 image provider/refiner，S3 通过单独模块复用其 local-only build 校验、共享 provider 和设备同步 helper。运行行为、共享权重关系和官方 API 调用序列不变。
+
+### 2026-08-05 — S3 真实 VILA+SAM2 视频 plumbing gate 通过
+
+- **完成内容**：在 `evovila` 环境和单张 A800 上 offline 加载本地 VILA1.5-3B 与 SAM2.1 Hiera Tiny，对 3 帧 synthetic moving-object video 分别执行默认首帧 anchor 和显式中间帧 anchor 的完整 pipeline；两次均只把随机 decoder 的 predicted binary mask 作为 SAM2 prompt。
+- **遇到的问题**：本机 SAM2 的可选 `_C` CUDA 后处理扩展未编译，官方 predictor 发出 warning 后自动跳过小孔填充；主 image encoder、mask prompt、memory propagation 和输出恢复均正常。smoke 运行在尚未提交的 S3 worktree 上，base commit 为 `bab23c4`，因此 JSON 需要显式记录 dirty-worktree 状态以避免 provenance 歧义。
+- **解决方案**：默认 anchor=0 的真实 forward-only smoke 和 anchor=1 的真实 bidirectional smoke 均通过；后者分项为 VILA 初始化 84757.23 ms、SAM2 初始化 2438.54 ms、VILA query total 127.63 ms（vision encoder 25.08 ms、LLM 39.87 ms）、SAM2 anchor encoder 183.24 ms、mask decoder 41.56 ms、临时 frame I/O 32.29 ms、video state 初始化 136.67 ms、predicted-anchor prompt 131.05 ms、forward propagation 100.31 ms、reverse propagation 58.73 ms、SAM2 video total 462.06 ms、pipeline total 848.62 ms，峰值显存 6771.03 MiB。raw/coarse/propagated shape 为 `[1,3,3,96,128]`、`[1,1,1,64,64]`、`[1,1,3,96,128]`；query 原始 `[49,50,51]` 映射到 fused `[643,644,645]`。两次 ordinary VILA retention 均精确通过（最大 final-token logit 差 0.0），VILA/SAM2 冻结、SAM2 lazy import、finite 输出、image/video/capability state cleanup 均通过。decoder 仍为随机初始化，本 gate 不评价 mask 质量。
+
+### S3 真实 VILA+SAM2 predicted-anchor video smoke
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
+  --vila-model /path/to/local/VILA1.5-3b \
+  --sam2-source-root /path/to/local/sam2 \
+  --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+```
+
+- **参数说明**：三个模型资产参数都要求已有的 Git 外部本地路径；`--video` 可选，支持 MP4 或 JPEG 目录，省略时生成 deterministic 3-frame RGB；`--anchor-index` 可选，省略时使用第一个有效帧；`--config` 默认 `configs/evo_seg/s3_video.yaml`；`--output` 可选且必须位于仓库外。
+- **运行后会发生什么**：强制 offline 模式，VILA 读取完整视频与 multi-token query，decoder 只预测一个固定 anchor mask；该预测 mask 经零阈值二值化后作为唯一 SAM2 prompt，并按需正反向传播。运行前后比较 ordinary VILA final-token logits，不下载资产、不训练参数。
+- **输出什么**：stdout JSON 包含 commit/dirty-worktree/config provenance、anchor 策略、shape、finite/frozen/lazy-import/state-clear/retention 检查、VILA vision/LLM、anchor encoder、decoder、frame I/O、state init、prompt、forward/reverse propagation、总时间与峰值显存；随机 decoder 输出只用于 plumbing。
+
+### 2026-08-05 — S3 提交前最终验证
+
+- **完成内容**：在 image/video adapter 拆分和文档同步后的最终工作树，重跑全部 EvoVILA-Seg no-weight tests、所有 extension/VILA hook/smoke 静态编译、包级/image/video 模块的外部 SAM2 import isolation 和 Git 空白检查。
+- **遇到的问题**：pytest 仅保留现有依赖的 17 条 deprecation/future warnings，无失败；真实视频 smoke 的 `_C` 可选后处理 warning 已作为环境限制单独记录，不影响 gate 结论。
+- **解决方案**：最终 no-weight suite 为 72 passed；`py_compile`、独立进程 import isolation 和 `git diff --check` 均通过。S3 真实 forward-only 与 bidirectional smoke 结果保持有效，未下载资产、未启动训练、未生成仓库内结果文件。
+
+### 2026-08-05 — S3 暂存审查完成
+
+- **完成内容**：仅暂存 8 个 S3 代码、配置、测试和文档文件；核对新增内容不含本机资产绝对路径、权重、数据、结果、缓存或凭据，remote 与 `long_rl` submodule 关系保持不变。
+- **遇到的问题**：`git diff --cached --check` 发现 `sam2_video_adapter.py` 末尾多一个空白行。
+- **解决方案**：仅移除该 EOF 空白并重新执行 staged whitespace/content 审查；不改变运行行为。

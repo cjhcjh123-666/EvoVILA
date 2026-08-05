@@ -22,8 +22,12 @@ loading an external SAM2 source tree explicitly. The complete opt-in
 VILA+decoder+SAM2 image path has also passed with a local VILA1.5-3B checkpoint,
 including exact ordinary-VILA logit retention before and after the extension
 call. The spatial decoder is still randomly initialized, so this verifies
-plumbing rather than segmentation quality. Video propagation and model
-fine-tuning remain deferred.
+    plumbing rather than segmentation quality. S3 now adds a separate opt-in
+    video path that predicts one fixed anchor mask and passes only that predicted
+    mask to a shared-weight SAM2 video predictor. Real A800 smokes passed for
+    both first-frame forward propagation and explicit middle-frame bidirectional
+    propagation, with exact ordinary-VILA logit retention. Model fine-tuning and
+    segmentation-quality claims remain deferred.
 
 ```bash
 conda activate /9950backfile/chenjiahui/.conda/envs/evovila
@@ -34,6 +38,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_sam2_image.py \
   --checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
   --device cuda:0
 CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_image_segmentation.py \
+  --vila-model /path/to/local/VILA1.5-3b \
+  --sam2-source-root /path/to/local/sam2 \
+  --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
   --vila-model /path/to/local/VILA1.5-3b \
   --sam2-source-root /path/to/local/sam2 \
   --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \

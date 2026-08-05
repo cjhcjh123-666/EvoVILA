@@ -1,0 +1,38 @@
+sam2:
+  source_root: null
+  model_config: configs/sam2.1/sam2.1_hiera_t.yaml
+  checkpoint_path: null
+  device: cuda
+  apply_postprocessing: true
+
+video:
+  offload_video_to_cpu: true
+  offload_state_to_cpu: false
+  jpeg_quality: 95
+
+request:
+  enabled: true
+  task: video
+
+input:
+  video_path: null
+  synthetic_frames: 3
+  synthetic_height: 96
+  synthetic_width: 128
+
+prompt:
+  query: bright red rectangle
+  instruction_template: "Track and segment the object described by this referring expression: {query}."
+
+decoder:
+  feature_dim: 256
+  model_dim: 128
+  num_heads: 8
+  num_layers: 2
+  num_object_queries: 1
+  dropout: 0.0
+
+anchor:
+  policy: first_valid
+
+seed: 123
