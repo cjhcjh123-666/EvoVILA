@@ -1,6 +1,6 @@
 # Implementation Guide - EvoVILA-Seg Spatiotemporal Segmentation
 
-> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IMAGE_PLUMBING_COMPLETE; S3_VIDEO_PLUMBING_COMPLETE; S4_DEFERRED
+> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IMAGE_PLUMBING_COMPLETE; S3_VIDEO_PLUMBING_COMPLETE; S4A_MASK_DATA_CONTRACT_DESIGN_FROZEN; S4B_TRAINING_DEFERRED
 > Basis: user-confirmed architecture and repository audit. A formal `docs/idea_report.md` Part 3 does not yet exist, so benchmark-scale training remains outside this implementation milestone.
 
 ## 1 Original Project And Scope
@@ -44,6 +44,7 @@ llava/
     ├── sam2_video_adapter.py
     ├── image_pipeline.py
     ├── video_pipeline.py
+    ├── training_contracts.py
     └── training.py
 tests/
 ├── test_evo_seg_contracts.py
@@ -55,6 +56,7 @@ tests/
 ├── test_evo_seg_sam2_adapter.py
 ├── test_evo_seg_image_pipeline.py
 ├── test_evo_seg_video_pipeline.py
+├── test_evo_seg_training_contracts.py
 └── test_evo_seg_baseline.py
 scripts/
 └── evo_seg/
@@ -89,6 +91,7 @@ configs/
 | `llava/evo_seg/sam2_video_adapter.py` | Lazy shared-weight video builder and predicted-anchor propagation | RGB videos and anchor logits | padded propagated mask tubes | S3 |
 | `llava/evo_seg/image_pipeline.py` | Compose the opt-in VILA adapter, spatial decoder result, and SAM2 image refinement | tokenized VILA media/query plus raw RGB | coarse and refined image masks | S2 |
 | `llava/evo_seg/video_pipeline.py` | Select a fixed predicted anchor and compose frozen VILA, spatial decoder, and SAM2 bidirectional propagation | tokenized VILA video/query plus raw RGB | coarse anchor and propagated video masks | S3 |
+| `llava/evo_seg/training_contracts.py` | Freeze external mask records, same-media query swaps, negative controls, split isolation, and ordinary-VILA retention probes without reading data | immutable metadata | validated manifest/probe contracts | S4a |
 | `llava/evo_seg/training.py` | Freeze policy and optimizer parameter selection | VILA, decoder, optional SAM2 | checked parameter groups | S4 |
 | `tests/test_evo_seg_contracts.py` | Reject malformed requests/batches/results and cover T=1/T>1 | synthetic tensors | pass/fail | S0 |
 | `tests/test_evo_seg_decoder.py` | Check shapes, invalid frames, gradients, and query sensitivity | synthetic tensors | pass/fail | S0 |
@@ -99,6 +102,7 @@ configs/
 | `tests/test_evo_seg_sam2_adapter.py` | Check raw RGB validation, lazy local build, frozen encoder, padding reconstruction, and mask refinement | fake official predictor API | pass/fail | S2 |
 | `tests/test_evo_seg_image_pipeline.py` | Check composed image output, explicit opt-in, T=1 enforcement, state cleanup, and import isolation | fake VILA/SAM2 harness | pass/fail | S2 |
 | `tests/test_evo_seg_video_pipeline.py` | Check predicted-mask prompting, fixed anchors, bidirectional propagation, padding reconstruction, cleanup, and import isolation | fake VILA/video-predictor harness | pass/fail | S3 |
+| `tests/test_evo_seg_training_contracts.py` | Check image/video alignment, local external paths, same-media different-target swaps, negative coverage, split leakage, retention probes, and import isolation | metadata only | pass/fail | S4a |
 | `tests/test_evo_seg_baseline.py` | Check original text/image/multi-image/video contracts with extension disabled | draft media wrappers | pass/fail | S0 |
 | `scripts/evo_seg/smoke_decoder.py` | Reproducible no-weight S0 smoke entry point | CLI dimensions/seed/output path | JSON outside Git | S0 |
 | `scripts/evo_seg/smoke_sam2_image.py` | Exercise the real frozen SAM2 encoder/refinement provider without VILA weights | config plus local SAM2 source/checkpoint paths | JSON outside Git or stdout | S2 |
@@ -151,6 +155,39 @@ alignment. Image inputs use `T=1`; no image-only tensor rank is introduced.
 `frame_embeddings` are mask-weighted dense features for each object and frame;
 `object_embeddings` are their valid-frame pooled representation. Invalid frames
 must have zeroed logits and embeddings and must not contribute to losses.
+
+### 4.4 S4a Mask Training And Retention Metadata
+
+`MaskTrainingRecord` is one referring-expression target or negative control. It
+contains stable sample/media IDs, `image` or `video` type, an absolute external
+media path, strictly increasing sampled source-frame indices, aligned optional
+absolute mask paths, per-frame presence, one fixed anchor position, split,
+query, optional target ID, and `positive`, `no_object`, or `empty_query` kind.
+Image records have exactly one frame at source index zero. Positive records have
+at least one present mask and a present anchor. Negative controls contain no
+mask paths or presence; `no_object` keeps a non-empty query while `empty_query`
+requires an empty query and is evaluation-only because `GroundingBatch`
+correctly rejects an empty query token mask.
+
+`QuerySwapPair` names two distinct positive samples. A validated pair must use
+the same media, split, sampled frames, and anchor, but different query text and
+target IDs.
+It represents a symmetric same-media query swap; a loader must never construct
+this control by pairing unrelated media.
+
+`MaskTrainingManifest` freezes records and pairs, rejects duplicate sample IDs
+or source-media leakage across splits (checked by both stable media ID and exact
+media path), and requires every represented training or validation split to
+contain a valid query-swap pair, a same-media `no_object` control, and a
+same-media `empty_query` control. It performs metadata validation only and never
+opens media or mask files.
+
+`RetentionProbe` and `RetentionProbeSet` freeze ordinary VILA text,
+single-image, multi-image, and video inputs together with the exact frozen
+baseline model ID/revision and comparison mode. All four tasks are mandatory;
+segmentation capability fields are intentionally absent. Baseline outputs are
+captured outside Git before any training and compared using the same probes
+afterward.
 
 ## 5 Function-Level Implementation
 
@@ -474,6 +511,24 @@ JSON report distinguishes model initialization, VILA query encoding, SAM2
 encoding, decoder, refinement-with-reencode, total time, and peak CUDA memory;
 randomly initialized decoder masks are plumbing results, not quality claims.
 
+### 5.11 `llava/evo_seg/training_contracts.py` - S4a
+
+**`MaskTrainingRecord(...)`** validates one metadata-only sample without file
+I/O. **`optimization_eligible`** is true for positive and no-object samples and
+false for empty-query controls.
+
+**`QuerySwapPair(left_sample_id, right_sample_id)`** stores a canonical pair of
+sample IDs. **`MaskTrainingManifest(records, query_swap_pairs)`** validates
+record uniqueness, per-media signature consistency, source-media split
+isolation, pair semantics, and train/validation control coverage. Its immutable
+`summary` reports counts by split, media type, and control kind.
+
+**`RetentionProbe(...)`** validates ordinary VILA task cardinality and absolute
+external media paths. **`RetentionProbeSet(baseline_model_id,
+baseline_revision, probes)`** requires exactly one or more probes for each of
+text, single-image, multi-image, and video and exposes an immutable summary.
+Neither class imports VILA, SAM2, a dataset library, or torch.
+
 **`scripts/evo_seg/smoke_video_segmentation.py`** requires explicit local VILA
 model, SAM2 source, and SAM2 checkpoint paths. It constructs a deterministic
 three-frame moving-object video unless an external MP4/JPEG directory is given,
@@ -504,7 +559,8 @@ linear output and immutable base weights.
 | S1 | correct query spans after media expansion/padding; text/single-image/multi-image/video baseline smoke unchanged |
 | S2 | SAM2 lazy import; raw-image preprocessing metadata; frozen encoder; predictor state cleanup; real local-source encoder/refinement smoke; differentiable decoder output |
 | S3 | fixed predicted mask accepted as the only video anchor; `[B,N,T,H,W]` output with padded frames zero; forward/reverse propagation and state cleanup; separate VILA vision/LLM, anchor encoder, decoder, frame I/O, state initialization, anchor prompt, and propagation timing |
-| S4 | same-image different-target generalization, no-object false positives, image IoU/Dice, video J/F, capability retention |
+| S4a | metadata-only image/video mask records; fixed sampled-frame/anchor alignment; same-media different-target query swaps; no-object and empty-query coverage in train/val; source-media split isolation; four-task ordinary-VILA retention probes |
+| S4b | separately approved training recipe; same-image different-target generalization, no-object false positives, image IoU/Dice, video J/F, capability retention |
 
 The first real-data go/no-go check must contain at least two targets from the
 same image. A single-sample overfit can verify plumbing but cannot approve the
@@ -512,23 +568,31 @@ grounding representation.
 
 ## 8 Data Preparation
 
-No data is copied into the repository. Dataset adapters later consume external
-manifests containing:
+No data is copied into the repository. S4a validates metadata only; dataset
+adapters later consume external manifests containing records such as:
 
 ```json
 {
   "sample_id": "string",
+  "media_id": "stable-source-id",
   "media_path": "/absolute/external/path",
   "media_type": "image_or_video",
+  "frame_indices": [0],
   "query": "referring expression",
-  "mask_paths": ["one path per frame"],
-  "object_present": [true],
+  "target_id": "object-id-or-null",
+  "control_kind": "positive_or_no_object_or_empty_query",
+  "mask_paths": ["/absolute/external/mask-or-null"],
+  "target_presence": [true],
+  "anchor_position": 0,
   "split": "train_or_val_or_test"
 }
 ```
 
-Train/validation splits must be disjoint by source image or video, not merely by
-expression. Same-image target groups stay in the same batch for shortcut tests.
+Frame indices, mask paths, and presence have identical length and order. Split
+isolation is checked by stable `media_id` and exact `media_path`, not expression
+or target. Same-media positive targets and negative controls remain in the same
+split; query-swap pairs are declared explicitly rather than inferred by a
+collator.
 
 ## 9 Result Formats
 
@@ -557,7 +621,8 @@ task metric deltas.
 7. Implement S1 provenance and local VILA wrapper. (complete)
 8. Implement S2 lazy SAM2 image adapter and complete real VILA+SAM2 image plumbing smoke. (complete; decoder untrained)
 9. Implement S3 predicted-anchor video propagation. (complete; decoder untrained)
-10. Design and separately approve S4 real-data training.
+10. Freeze S4a mask metadata, negative-control, query-swap, split-isolation, and retention contracts.
+11. Design and separately approve S4b real-data training only after S4a passes.
 
 ## 11 Design Validation
 

@@ -364,3 +364,33 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **完成内容**：仅暂存 8 个 S3 代码、配置、测试和文档文件；核对新增内容不含本机资产绝对路径、权重、数据、结果、缓存或凭据，remote 与 `long_rl` submodule 关系保持不变。
 - **遇到的问题**：`git diff --cached --check` 发现 `sam2_video_adapter.py` 末尾多一个空白行。
 - **解决方案**：仅移除该 EOF 空白并重新执行 staged whitespace/content 审查；不改变运行行为。
+
+### 2026-08-05 — S4a mask data 与 retention contract 设计冻结
+
+- **完成内容**：在 S2/S3 plumbing 通过后审计现有 `GroundingBatch`、loss、数据准备占位和 retention 要求；将训练前置工作拆为 S4a metadata contract 与需另行批准的 S4b training recipe。
+- **遇到的问题**：仓库没有 `idea_report.md` Part 3、真实训练结果或数据 manifest，现有占位 schema 缺少稳定 media ID、采样帧索引、固定 anchor、target ID、same-media query-swap 声明、empty/no-object 语义与 source-media split leakage 检查。empty query 也不能伪装成普通 `GroundingBatch`，因为现有非空 query invariant 会正确拒绝它。
+- **解决方案**：设计独立、无文件 I/O 的 `training_contracts.py`：逐样本固定 frame/mask/presence/anchor 对齐；positive/no-object 可进入后续优化，empty-query 只做 fail-closed 评估；query swap 只能连接同媒体不同真实目标；train/val 必须分别覆盖 swap/no-object/empty-query；retention probe set 必须覆盖 ordinary VILA 的 text、single-image、multi-image、video，并绑定 frozen baseline revision。此阶段不实现 loader、optimizer 或训练 recipe。
+
+### 2026-08-05 — S4a metadata contracts 实现
+
+- **完成内容**：新增 `training_contracts.py`，实现不可变 `MaskTrainingRecord`、`QuerySwapPair`、`MaskTrainingManifest`、`RetentionProbe` 与 `RetentionProbeSet`，以及不可变覆盖统计。
+- **遇到的问题**：empty-query 控制若混入优化 batch 会违反已冻结的非空 query token invariant；同一 media 的不同 query 若允许各自选择帧或 anchor，会让 query-swap 不再是受控变量。
+- **解决方案**：empty-query 明确标为 `optimization_eligible=False`；manifest 要求同一 `media_id` 共享 media path/type、sampled frame indices、anchor 和 split。模块只验证元数据及绝对路径字符串，不读取文件，不导入 torch/VILA/SAM2，也不改变任何现有执行路径。
+
+### 2026-08-05 — S4a control eligibility 测试夹具修正
+
+- **完成内容**：修正 positive/no-object/empty-query eligibility 测试的 record 索引。
+- **遇到的问题**：首轮目标测试为 15 passed、1 failed；`records[0::2]` 只返回 positive 和 no-object 两项，却被解包为三项，失败发生在 contract 断言前。
+- **解决方案**：改为显式索引 records 0、2、3，不改变 contract 或测试场景。
+
+### 2026-08-05 — S4a 提交前契约审查收紧
+
+- **完成内容**：补充 exact media path 的跨 split 泄漏检查，并要求 query-swap 两侧同时具有不同 query text 与 target ID；同步增加回归测试和实现文档约束。
+- **遇到的问题**：仅依赖稳定 `media_id` 无法拦截同一媒体路径被错误重标 ID 后分入 train/val；不同 target 若使用完全相同 query，不能形成有意义的 swapped-query 负控。
+- **解决方案**：manifest 同时按 `media_id` signature 和 exact `media_path` 检查 split；query-swap 在相同 media/frame/anchor 基础上拒绝相同 query text。仍只验证元数据，不打开任何外部文件。
+
+### 2026-08-05 — S4a 提交前最终验证
+
+- **完成内容**：运行 S4a 目标测试、全部 EvoVILA-Seg no-weight 回归、扩展/VILA hook/smoke 静态编译、独立进程导入隔离和 Git 空白检查。
+- **遇到的问题**：完整 pytest 仅报告既有依赖的 17 条 deprecation/future warnings，无测试失败；流式工具的短等待窗口曾截断 pytest 末尾显示，因此使用持续轮询重新取得完整退出码与摘要。
+- **解决方案**：目标测试为 16 passed；完整回归为 88 passed、17 warnings；`py_compile`、`llava.model`/external SAM2 import isolation 和 `git diff --check` 均通过。未读取数据、加载权重、运行 GPU 或启动训练。
