@@ -16,8 +16,9 @@ SAM2-free tensor contracts, query-conditioned spatial decoder, losses, and
 no-weight smoke tests. S1 adds frozen multi-token VILA query extraction through
 an inactive-by-default fusion observer and an opt-in adapter. Ordinary VILA
 requests do not import or execute the segmentation package, dense provider, or
-SAM2. A real SAM2 provider, video propagation, and model fine-tuning remain
-deferred to later milestones.
+SAM2. S2 now contains a local-only lazy SAM2 image provider boundary, but the
+real checkpoint smoke is pending a compatible external SAM2 installation and
+checkpoint. Video propagation and model fine-tuning remain deferred.
 
 ```bash
 conda activate /9950backfile/chenjiahui/.conda/envs/evovila

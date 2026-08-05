@@ -1,6 +1,6 @@
 # Implementation Guide - EvoVILA-Seg Spatiotemporal Segmentation
 
-> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2-S4 DEFERRED
+> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IN_PROGRESS; S3-S4 DEFERRED
 > Basis: user-confirmed architecture and repository audit. A formal `docs/idea_report.md` Part 3 does not yet exist, so benchmark-scale training remains outside this implementation milestone.
 
 ## 1 Original Project And Scope
@@ -47,6 +47,7 @@ tests/
 ├── test_evo_seg_capability.py
 ├── test_evo_seg_provenance.py
 ├── test_evo_seg_vila_adapter.py
+├── test_evo_seg_sam2_adapter.py
 └── test_evo_seg_baseline.py
 scripts/
 └── evo_seg/
@@ -84,6 +85,7 @@ configs/
 | `tests/test_evo_seg_capability.py` | Check explicit opt-in, public entry, timings, and import isolation | fake decoder/batch | pass/fail | S0 |
 | `tests/test_evo_seg_provenance.py` | Check text/media expansion, left/right padding, truncation, and query gathering | fake fused rows/hidden states | pass/fail | S1 |
 | `tests/test_evo_seg_vila_adapter.py` | Check frozen teacher forcing, multi-token extraction, dense provider bridge, and default isolation | no-weight VILA harness | pass/fail | S1 |
+| `tests/test_evo_seg_sam2_adapter.py` | Check raw RGB validation, lazy local build, frozen encoder, padding reconstruction, and mask refinement | fake official predictor API | pass/fail | S2 |
 | `tests/test_evo_seg_baseline.py` | Check original text/image/multi-image/video contracts with extension disabled | draft media wrappers | pass/fail | S0 |
 | `scripts/evo_seg/smoke_decoder.py` | Reproducible no-weight S0 smoke entry point | CLI dimensions/seed/output path | JSON outside Git | S0 |
 | `scripts/evo_seg/smoke_image_segmentation.py` | Exercise the real opt-in image path | config and local asset paths | JSON outside Git | S2 |
@@ -258,14 +260,23 @@ mutable media context is used, keeping concurrent requests independent.
 
 SAM2 imports occur inside builder functions only.
 
-**`build_sam2_image_encoder(options, device) -> nn.Module`** lazily validates
-the external source, config, and checkpoint.
+**`RGBFrameBatch`** accepts only CPU `uint8` RGB pixels with shape
+`[B,T,3,H,W]` and a boolean `[B,T]` frame mask. VILA-normalized tensors are
+rejected so SAM2 always performs its own resize/normalization.
 
-**`encode_frames(frames, frame_mask) -> DenseFeatureBatch`** uses SAM2's own
-RGB preprocessing and returns `[B,T,C,H,W]` plus coordinate metadata.
+**`build_sam2_image_predictor(options) -> SAM2ImagePredictor`** lazily
+validates a local official source tree, package-relative config, explicit local
+checkpoint, and device. It never accepts a remote model ID or downloads an
+asset. The returned model is put in eval mode and all parameters are frozen.
 
-**`refine_masks(frames, coarse_masks, frame_mask) -> Tensor`** refines predicted
-coarse masks without accepting human prompts.
+**`SAM2ImageFeatureProvider.encode_frames(batch) -> DenseFeatureBatch`** calls
+the official `set_image_batch`, reads `image_embed [N,C,H,W]`, reconstructs
+`[B,T,C,H,W]`, zeroes invalid frames, clones the result, and immediately clears
+predictor image state under a lock.
+
+**`SAM2ImageFeatureProvider.refine_masks(batch, coarse_masks) -> Tensor`**
+resizes decoder logits to SAM2's mask-prompt size and calls `predict_batch`
+without point/box/human prompts. The returned shape is `[B,N,T,Hrgb,Wrgb]`.
 
 **`propagate_anchor_mask(video, anchor_index, anchor_mask) -> Tensor`** calls
 the official SAM2 video predictor's mask-prompt path and returns `[T,H,W]`.
@@ -320,10 +331,12 @@ teacher forcing with `packing=False`, `output_hidden_states=True`,
 VILA parameters, or reduces the selected expression to one token.
 
 **`VILASegmentationAdapter.segment(input_ids, media, media_config,
-query_token_mask, request, attention_mask=None) -> SegmentationResult`**
+query_token_mask, request, attention_mask=None, dense_input=None) ->
+SegmentationResult`**
 requires an enabled request, extracts query states, invokes the named injected
 dense provider, builds `GroundingBatch`, calls `SegmentationCapability`, and
 records VILA query, dense provider, decoder, and total time separately.
+`dense_input` keeps raw SAM2 RGB pixels separate from VILA-preprocessed media.
 
 ### 5.7 S0 Tests, Configuration, And Smoke Entry Point
 
@@ -433,7 +446,7 @@ task metric deltas.
 5. Run the complete no-weight suite, `py_compile`, and `git diff --check`.
 6. Review S0 before adding any VILA-core hook.
 7. Implement S1 provenance and local VILA wrapper. (complete)
-8. Implement S2 lazy SAM2 image adapter.
+8. Implement S2 lazy SAM2 image adapter. (boundary complete; real-asset smoke pending)
 9. Implement S3 predicted-anchor video propagation.
 10. Design and separately approve S4 real-data training.
 

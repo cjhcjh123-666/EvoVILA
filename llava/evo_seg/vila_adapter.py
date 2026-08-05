@@ -205,7 +205,7 @@ class VILASegmentationAdapter:
 
     def _run_dense_provider(
         self,
-        media: Optional[Mapping[str, Any]],
+        media: Any,
         media_config: Optional[Mapping[str, Any]],
         request: SegmentationRequest,
     ) -> tuple[DenseFeatureBatch, float]:
@@ -229,6 +229,7 @@ class VILASegmentationAdapter:
         request: Any,
         attention_mask: Optional[Tensor] = None,
         hidden_layer: int = -1,
+        dense_input: Any = None,
     ) -> SegmentationResult:
         """Run the complete opt-in language-conditioned segmentation path."""
 
@@ -246,7 +247,8 @@ class VILASegmentationAdapter:
             attention_mask,
             hidden_layer,
         )
-        dense, provider_ms = self._run_dense_provider(media, media_config, normalized)
+        provider_input = media if dense_input is None else dense_input
+        dense, provider_ms = self._run_dense_provider(provider_input, media_config, normalized)
         if dense.features.shape[0] != query_states.states.shape[0]:
             raise ValueError("dense provider batch size must match VILA query batch")
         if normalized.task == "image" and dense.features.shape[1] != 1:

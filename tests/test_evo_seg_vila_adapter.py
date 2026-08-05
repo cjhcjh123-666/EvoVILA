@@ -254,6 +254,27 @@ def test_adapter_extracts_multi_token_states_without_grad_and_segments():
     assert provider.calls[-1][2].task == "video"
 
 
+def test_adapter_keeps_vila_media_separate_from_dense_input():
+    model = _AdapterModel()
+    provider = _Provider()
+    adapter = VILASegmentationAdapter(model, provider, SegmentationCapability(_AdapterDecoder()))
+    input_ids = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]], dtype=torch.long)
+    query_mask = torch.tensor(
+        [[True, False, True, False, False], [False, True, False, True, True]], dtype=torch.bool
+    )
+    raw_dense_input = object()
+    adapter.segment(
+        input_ids,
+        {"image": "vila-preprocessed"},
+        {},
+        query_mask,
+        {"enabled": True, "task": "video"},
+        dense_input=raw_dense_input,
+    )
+    assert model.calls[-1]["media"] == {"image": "vila-preprocessed"}
+    assert provider.calls[-1][0] is raw_dense_input
+
+
 def test_adapter_disabled_request_does_not_call_model_or_provider():
     model = _AdapterModel()
     provider = _Provider()

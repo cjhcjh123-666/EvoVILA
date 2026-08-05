@@ -40,6 +40,8 @@
 | S1 VILA hook | `llava/model/llava_arch.py` | ✅ Done | 2026-08-05 | 两个 native `_embed`；默认路径不变 |
 | S1 VILA adapter | `llava/evo_seg/vila_adapter.py` | ✅ Done | 2026-08-05 | frozen query extraction、dense bridge、分项计时 |
 | S1 integration tests | `tests/test_evo_seg_vila_adapter.py` | ✅ Done | 2026-08-05 | 9 passed；全套 45 passed |
+| S2 RGB/SAM2 boundary | `llava/evo_seg/sam2_adapter.py` | 🚧 In progress | 2026-08-05 | lazy local build；真实资产 smoke 待完成 |
+| S2 boundary tests | `tests/test_evo_seg_sam2_adapter.py` | ✅ Done | 2026-08-05 | 7 passed；全套 53 passed |
 
 ## 开发日志
 
@@ -133,6 +135,24 @@
 - **遇到的问题**：fake media 每个展开块长度不同，初版测试的预期 fused length 计算错误；top-down 私有 helper 还需返回 selection map/prob 三元组。
 - **解决方案**：按 native deque 消费顺序修正夹具并覆盖真实返回结构；`python -m pytest -q tests/test_evo_seg_*.py` 最终为 45 passed，无权重或数据下载。
 
+### 2026-08-05 — S0/S1 milestone 提交
+
+- **完成内容**：将已验证的 S0/S1 扩展、测试和文档提交为 `b625184`（`feat: add opt-in segmentation foundation`）。
+- **遇到的问题**：暂存检查发现 5 个新文件末尾存在额外空白行。
+- **解决方案**：只做 EOF 格式修正后重新执行 `git diff --cached --check`；未包含 cache、权重、数据、结果或原工作树的本地改动，未推送远端。
+
+### 2026-08-05 — S2 lazy SAM2 image boundary
+
+- **完成内容**：新增严格的 CPU uint8 `RGBFrameBatch`、本地-only `SAM2BuildOptions`、惰性官方 image predictor builder、dense image embedding provider 和 coarse-mask refinement；VILA adapter 新增显式 `dense_input`，不复用 VILA-normalized media。
+- **遇到的问题**：当前 `evovila` 环境没有 `sam2` 包或本地源码/checkpoint；官方主线文档要求 PyTorch 2.5.1+，而现有环境为 PyTorch 2.4.1，仓库依赖还固定为 2.3.0，直接安装可能破坏 VILA 基线。
+- **解决方案**：不安装、不升级、不下载；使用遵循官方 `set_image_batch`/`predict_batch` API 的 fake predictor 验证 lazy import、冻结、padding、状态清理和 refinement。S2 保持 In progress，等待独立兼容性决策和真实资产 smoke。
+
+### 2026-08-05 — S2 boundary regression
+
+- **完成内容**：新增 7 个 SAM2 boundary 测试，并增加 VILA media 与 raw dense input 隔离测试。
+- **遇到的问题**：无；SAM2 默认 builder 在本地源码缺失时 fail closed，且失败前不会导入 SAM2。
+- **解决方案**：`python -m pytest -q tests/test_evo_seg_*.py` 为 53 passed；仍未下载权重或数据。
+
 ## 运行说明
 
 ### 环境准备
@@ -174,3 +194,14 @@ python -m py_compile llava/model/fusion_observer.py llava/model/llava_arch.py ll
 - **参数说明**：使用 fake VILA/dense provider，不需要模型、SAM2 或数据路径。
 - **运行后会发生什么**：执行 native `_embed` provenance、显式 query span 提取和 opt-in decoder bridge；disabled path 不调用 VILA 或 dense provider。
 - **输出什么**：pytest 输出 15 个 S1 测试的通过/失败摘要；静态编译无输出即成功。
+
+### S2 SAM2 boundary 验证
+
+```bash
+python -m pytest -q tests/test_evo_seg_sam2_adapter.py
+python -m py_compile llava/evo_seg/sam2_adapter.py
+```
+
+- **参数说明**：使用 fake predictor；`configs/evo_seg/s2_image.yaml` 中的源码、checkpoint 和图像路径保持为空，真实运行时必须由仓库外路径覆盖。
+- **运行后会发生什么**：验证 raw RGB、lazy build、encoder freeze、无效帧清零、predictor 状态清理和 mask-prompt refinement。
+- **输出什么**：7 个 boundary 测试；不会安装/import SAM2，也不会产生模型或图像文件。
