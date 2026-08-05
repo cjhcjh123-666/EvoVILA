@@ -8,6 +8,26 @@
 
 [arXiv](https://arxiv.org/abs/2412.04468) / [Demo](https://vila.hanlab.ai/) / [Models](https://huggingface.co/collections/Efficient-Large-Model/nvila-674f8163543890b35a91b428) / [Subscribe](https://forms.gle/6nf1QdPYdvC2vgxM8)
 
+## EvoVILA-Seg Extension
+
+The `EvoVILA-Seg` branch is adding opt-in language-conditioned image and video
+segmentation while preserving the original VILA request path. S0 provides the
+SAM2-free tensor contracts, query-conditioned spatial decoder, losses, and
+no-weight smoke tests. S1 adds frozen multi-token VILA query extraction through
+an inactive-by-default fusion observer and an opt-in adapter. Ordinary VILA
+requests do not import or execute the segmentation package, dense provider, or
+SAM2. A real SAM2 provider, video propagation, and model fine-tuning remain
+deferred to later milestones.
+
+```bash
+conda activate /9950backfile/chenjiahui/.conda/envs/evovila
+python -m pytest -q tests/test_evo_seg_*.py
+python scripts/evo_seg/smoke_decoder.py
+```
+
+See `docs/implementation.md` for the gated S0-S4 implementation plan and
+`docs/dev_log.md` for verified status.
+
 ## 💡 Introduction
 
 VILA is a family of open VLMs designed to optimize both efficiency and accuracy for efficient video understanding and multi-image understanding. 

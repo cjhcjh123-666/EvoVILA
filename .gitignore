@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and credentials
+.env
+.venv/
+
+# External data, checkpoints, and generated artifacts
+/data/
+/logs/
+/results/
+/runs/
+*.bin
+*.ckpt
+*.pt
+*.pth
