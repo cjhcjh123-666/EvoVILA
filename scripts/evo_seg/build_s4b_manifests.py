@@ -8,6 +8,7 @@ downloads data or modifies VILA execution paths.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
 import sys
@@ -73,6 +74,40 @@ def _rasterize_mask(raw_anns: str, width: int, height: int, output: Path) -> Non
     canvas.save(output)
 
 
+def _process_image_row(task) -> Tuple[int, List[MaskTrainingRecord]]:
+    row, variant, split_name, coco_root, mask_root = task
+    records: List[MaskTrainingRecord] = []
+    image_id = int(row["image_id"])
+    ann_id = int(row["ann_id"])
+    image_path = _coco_image_path(coco_root, image_id)
+    raw_anns = str(row["raw_anns"])
+    raw_info = json.loads(str(row["raw_image_info"]))
+    width, height = int(raw_info["width"]), int(raw_info["height"])
+    mask_path = mask_root / variant / split_name / f"{image_id}_{ann_id}.png"
+    _rasterize_mask(raw_anns, width, height, mask_path)
+    for sentence_index, sentence in enumerate(row["sentences"]):
+        query = str(sentence["sent"]).strip()
+        if not query:
+            continue
+        records.append(
+            MaskTrainingRecord(
+                sample_id=f"refcoco.{row['ref_id']}.s{sentence_index}",
+                media_id=f"coco.{image_id}",
+                media_type="image",
+                media_path=str(image_path),
+                frame_indices=(0,),
+                mask_paths=(str(mask_path),),
+                target_presence=(True,),
+                anchor_position=0,
+                split=split_name,
+                query=query,
+                target_id=str(ann_id),
+                control_kind="positive",
+            )
+        )
+    return image_id, records
+
+
 def build_image_manifest(
     variant: str,
     split_name: str,
@@ -81,11 +116,10 @@ def build_image_manifest(
     mask_root: Path,
     max_rows: Optional[int],
     seed: int,
+    workers: int,
 ) -> Tuple[List[MaskTrainingRecord], List[QuerySwapPair], int]:
     frame = pd.read_parquet(parquet_path)
     rng = random.Random(seed)
-    # Group rows by image, preferring images with multiple referenced objects so
-    # every subset can provide same-media different-target query swaps.
     groups = [group for _, group in frame.groupby("image_id")]
     rng.shuffle(groups)
     groups.sort(key=lambda group: (group["ann_id"].nunique(), len(group)), reverse=True)
@@ -100,42 +134,18 @@ def build_image_manifest(
     if max_rows is not None:
         frame = frame.head(max_rows * 2)
 
+    tasks = [
+        (row.to_dict(), variant, split_name, coco_root, mask_root)
+        for _, row in frame.iterrows()
+    ]
     records: List[MaskTrainingRecord] = []
-    pairs: List[QuerySwapPair] = []
     positive_by_image: Dict[int, List[MaskTrainingRecord]] = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        for image_id, row_records in pool.map(_process_image_row, tasks, chunksize=32):
+            records.extend(row_records)
+            positive_by_image.setdefault(image_id, []).extend(row_records)
 
-    for _, row in frame.iterrows():
-        image_id = int(row["image_id"])
-        ann_id = int(row["ann_id"])
-        image_path = _coco_image_path(coco_root, image_id)
-        raw_anns = str(row["raw_anns"])
-        raw_info = json.loads(str(row["raw_image_info"]))
-        width, height = int(raw_info["width"]), int(raw_info["height"])
-        mask_path = mask_root / variant / split_name / f"{image_id}_{ann_id}.png"
-        _rasterize_mask(raw_anns, width, height, mask_path)
-
-        for sentence_index, sentence in enumerate(row["sentences"]):
-            query = str(sentence["sent"]).strip()
-            if not query:
-                continue
-            record = MaskTrainingRecord(
-                sample_id=f"refcoco.{row['ref_id']}.s{sentence_index}",
-                media_id=f"coco.{image_id}",
-                media_type="image",
-                media_path=str(image_path),
-                frame_indices=(0,),
-                mask_paths=(str(mask_path),),
-                target_presence=(True,),
-                anchor_position=0,
-                split=split_name,
-                query=query,
-                target_id=str(ann_id),
-                control_kind="positive",
-            )
-            records.append(record)
-            positive_by_image.setdefault(image_id, []).append(record)
-
-    # Same-image different-target query swaps.
+    pairs: List[QuerySwapPair] = []
     used_pairs = set()
     for image_id, image_records in positive_by_image.items():
         targets: Dict[str, List[MaskTrainingRecord]] = {}
@@ -144,8 +154,22 @@ def build_image_manifest(
         target_ids = sorted(targets)
         if len(target_ids) < 2:
             continue
-        left = targets[target_ids[0]][0]
-        right = targets[target_ids[1]][0]
+        left = right = None
+        for left_index in range(len(target_ids)):
+            for right_index in range(left_index + 1, len(target_ids)):
+                for left_record in targets[target_ids[left_index]]:
+                    for right_record in targets[target_ids[right_index]]:
+                        if left_record.query != right_record.query:
+                            left, right = left_record, right_record
+                            break
+                    if left is not None:
+                        break
+                if left is not None:
+                    break
+            if left is not None:
+                break
+        if left is None:
+            continue
         key = tuple(sorted((left.sample_id, right.sample_id)))
         if key in used_pairs:
             continue
@@ -232,13 +256,10 @@ def _object_present_train(ann_root: Path, video_id: str, frame: int, pixel_value
     return bool((array == pixel_value).any())
 
 
-def build_video_manifest(
-    extracted_root: Path,
-    split_name: str,
-    max_videos: Optional[int],
-    seed: int,
-    mask_root: Path,
-) -> Tuple[List[MaskTrainingRecord], List[QuerySwapPair], int]:
+def _process_video(task) -> Tuple[str, List[MaskTrainingRecord], Optional[QuerySwapPair]]:
+    video_id, split_name, extracted_root, mask_root = task
+    extracted_root = Path(extracted_root)
+    mask_root = Path(mask_root)
     if split_name == "train":
         meta_path = extracted_root / "train/meta.json"
         expr_path = extracted_root / "meta_expressions/train/meta_expressions.json"
@@ -249,8 +270,6 @@ def build_video_manifest(
         expr_path = extracted_root / "valid/meta_expressions_challenge.json"
         jpg_root = extracted_root / "valid/JPEGImages"
         ann_root = extracted_root / "valid/Annotations"
-        # Official Ref-YT-VOS valid stores per-object annotation directories
-        # instead of a train-style meta.json.
         meta = {
             "videos": {
                 video_dir.name: {
@@ -267,6 +286,154 @@ def build_video_manifest(
             }
         }
     expressions = json.loads(expr_path.read_text())
+    objects = meta["videos"][video_id].get("objects", {})
+    expressions_video = expressions["videos"][video_id].get("expressions", {})
+    is_train = split_name == "train"
+    pixel_map = _build_pixel_to_object_map(ann_root, video_id, objects) if is_train else {}
+
+    all_frames = sorted({frame for obj in objects.values() for frame in obj.get("frames", [])})
+    if len(all_frames) < 2:
+        return video_id, [], None
+
+    def presence_at(obj_id: str, frame: str) -> bool:
+        if is_train:
+            pixel_value = pixel_map.get(obj_id)
+            return _object_present_train(ann_root, video_id, int(frame), pixel_value) if pixel_value is not None else False
+        return (ann_root / video_id / obj_id / f"{int(frame):05d}.png").is_file()
+
+    presence_counts = {
+        frame: sum(presence_at(obj_id, frame) for obj_id in objects)
+        for frame in all_frames
+    }
+    ordered = sorted(all_frames, key=lambda frame: (-presence_counts[frame], frame))
+    sampled = sorted(ordered[:5])
+    anchor_frame = sampled[0]
+
+    expressions_by_obj: Dict[str, List[str]] = {}
+    for info in expressions_video.values():
+        obj_id = str(info["obj_id"])
+        query = str(info["exp"]).strip()
+        if query:
+            expressions_by_obj.setdefault(obj_id, []).append(query)
+
+    records: List[MaskTrainingRecord] = []
+    video_records: List[MaskTrainingRecord] = []
+    for obj_id, queries in expressions_by_obj.items():
+        if obj_id not in objects:
+            continue
+        if not presence_at(obj_id, anchor_frame):
+            continue
+        if not queries:
+            continue
+        presence = tuple(presence_at(obj_id, frame) for frame in sampled)
+        if is_train:
+            pixel_value = pixel_map.get(obj_id)
+            saved_paths = []
+            for frame, present in zip(sampled, presence):
+                if not present:
+                    saved_paths.append(None)
+                    continue
+                source = ann_root / video_id / f"{int(frame):05d}.png"
+                destination = mask_root / split_name / f"{video_id}_{obj_id}_{int(frame):05d}.png"
+                if pixel_value is None:
+                    raise RuntimeError(f"pixel map missing object {obj_id} in video {video_id}")
+                array = np.asarray(Image.open(source).convert("L"))
+                binary = ((array == pixel_value).astype(np.uint8)) * 255
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(binary).save(destination)
+                saved_paths.append(str(destination))
+            mask_paths = tuple(saved_paths)
+        else:
+            mask_paths = tuple(
+                str(ann_root / video_id / obj_id / f"{int(frame):05d}.png") if present else None
+                for frame, present in zip(sampled, presence)
+            )
+        record = MaskTrainingRecord(
+            sample_id=f"ryvos.{split_name}.{video_id}.{obj_id}.{len(video_records)}",
+            media_id=f"ryvos.{video_id}",
+            media_type="video",
+            media_path=str(jpg_root / video_id),
+            frame_indices=tuple(int(frame) for frame in sampled),
+            mask_paths=mask_paths,
+            target_presence=presence,
+            anchor_position=0,
+            split=split_name,
+            query=queries[0],
+            target_id=obj_id,
+            control_kind="positive",
+        )
+        records.append(record)
+        video_records.append(record)
+
+    pair = (
+        QuerySwapPair(video_records[0].sample_id, video_records[1].sample_id)
+        if len(video_records) >= 2
+        else None
+    )
+
+    if video_records:
+        absent_query = None
+        for obj_id, queries in expressions_by_obj.items():
+            if obj_id not in objects or obj_id in {r.target_id for r in video_records}:
+                continue
+            if not any(presence_at(obj_id, frame) for frame in sampled):
+                absent_query = queries[0]
+                break
+        no_object_query = (
+            f"{absent_query} (not present)" if absent_query else f"{video_records[0].query} (not present)"
+        )
+        records.append(
+            MaskTrainingRecord(
+                sample_id=f"ryvos.{split_name}.{video_id}.no_object",
+                media_id=f"ryvos.{video_id}",
+                media_type="video",
+                media_path=str(jpg_root / video_id),
+                frame_indices=tuple(int(frame) for frame in sampled),
+                mask_paths=(None,) * len(sampled),
+                target_presence=(False,) * len(sampled),
+                anchor_position=0,
+                split=split_name,
+                query=no_object_query,
+                target_id=None,
+                control_kind="no_object",
+            )
+        )
+        records.append(
+            MaskTrainingRecord(
+                sample_id=f"ryvos.{split_name}.{video_id}.empty_query",
+                media_id=f"ryvos.{video_id}",
+                media_type="video",
+                media_path=str(jpg_root / video_id),
+                frame_indices=tuple(int(frame) for frame in sampled),
+                mask_paths=(None,) * len(sampled),
+                target_presence=(False,) * len(sampled),
+                anchor_position=0,
+                split=split_name,
+                query="",
+                target_id=None,
+                control_kind="empty_query",
+            )
+        )
+    return video_id, records, pair
+
+
+def build_video_manifest(
+    extracted_root: Path,
+    split_name: str,
+    max_videos: Optional[int],
+    seed: int,
+    mask_root: Path,
+    workers: int,
+) -> Tuple[List[MaskTrainingRecord], List[QuerySwapPair], int]:
+    if split_name == "train":
+        meta_path = extracted_root / "train/meta.json"
+        expr_path = extracted_root / "meta_expressions/train/meta_expressions.json"
+        meta = json.loads(meta_path.read_text())
+    else:
+        expr_path = extracted_root / "valid/meta_expressions_challenge.json"
+        meta = json.loads(expr_path.read_text())
+        meta = {"videos": {video_id: {"objects": {}} for video_id in meta["videos"]}}
+    expressions = json.loads(expr_path.read_text())
 
     rng = random.Random(seed)
     video_ids = sorted(set(meta["videos"]) & set(expressions["videos"]))
@@ -274,135 +441,14 @@ def build_video_manifest(
     if max_videos is not None:
         video_ids = video_ids[:max_videos]
 
+    tasks = [(video_id, split_name, extracted_root, mask_root) for video_id in video_ids]
     records: List[MaskTrainingRecord] = []
     pairs: List[QuerySwapPair] = []
-    positive_by_video: Dict[str, List[MaskTrainingRecord]] = {}
-
-    for video_id in video_ids:
-        objects = meta["videos"][video_id].get("objects", {})
-        expressions_video = expressions["videos"][video_id].get("expressions", {})
-        is_train = split_name == "train"
-        pixel_map = _build_pixel_to_object_map(ann_root, video_id, objects) if is_train else {}
-
-        # One common sampled frame set per video so every record over the same
-        # media shares frames and anchor (required by the frozen contract).
-        all_frames = sorted({frame for obj in objects.values() for frame in obj.get("frames", [])})
-        if len(all_frames) < 2:
-            continue
-
-        def presence_at(obj_id: str, frame: str) -> bool:
-            if is_train:
-                pixel_value = pixel_map.get(obj_id)
-                return _object_present_train(ann_root, video_id, int(frame), pixel_value) if pixel_value is not None else False
-            return (ann_root / video_id / obj_id / f"{int(frame):05d}.png").is_file()
-
-        presence_counts = {
-            frame: sum(presence_at(obj_id, frame) for obj_id in objects)
-            for frame in all_frames
-        }
-        ordered = sorted(all_frames, key=lambda frame: (-presence_counts[frame], frame))
-        sampled = sorted(ordered[:5])
-        anchor_frame = sampled[0]
-
-        expressions_by_obj: Dict[str, List[str]] = {}
-        for info in expressions_video.values():
-            obj_id = str(info["obj_id"])
-            query = str(info["exp"]).strip()
-            if query:
-                expressions_by_obj.setdefault(obj_id, []).append(query)
-
-        video_records: List[MaskTrainingRecord] = []
-        for obj_id, queries in expressions_by_obj.items():
-            if obj_id not in objects:
-                continue
-            if not presence_at(obj_id, anchor_frame):
-                continue
-            if not queries:
-                continue
-            presence = tuple(presence_at(obj_id, frame) for frame in sampled)
-            if is_train:
-                pixel_value = pixel_map.get(obj_id)
-                saved_paths = []
-                for frame in sampled:
-                    source = ann_root / video_id / f"{int(frame):05d}.png"
-                    destination = mask_root / split_name / f"{video_id}_{obj_id}_{int(frame):05d}.png"
-                    if pixel_value is None:
-                        raise RuntimeError(f"pixel map missing object {obj_id} in video {video_id}")
-                    array = np.asarray(Image.open(source).convert("L"))
-                    binary = ((array == pixel_value).astype(np.uint8)) * 255
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    Image.fromarray(binary).save(destination)
-                    saved_paths.append(str(destination))
-                mask_paths = tuple(saved_paths)
-            else:
-                mask_paths = tuple(
-                    str(ann_root / video_id / obj_id / f"{int(frame):05d}.png") for frame in sampled
-                )
-            record = MaskTrainingRecord(
-                sample_id=f"ryvos.{split_name}.{video_id}.{obj_id}.{len(video_records)}",
-                media_id=f"ryvos.{video_id}",
-                media_type="video",
-                media_path=str(jpg_root / video_id),
-                frame_indices=tuple(int(frame) for frame in sampled),
-                mask_paths=mask_paths,
-                target_presence=presence,
-                anchor_position=0,
-                split=split_name,
-                query=queries[0],
-                target_id=obj_id,
-                control_kind="positive",
-            )
-            records.append(record)
-            video_records.append(record)
-
-        positive_by_video[video_id] = video_records
-        if len(video_records) >= 2:
-            pairs.append(QuerySwapPair(video_records[0].sample_id, video_records[1].sample_id))
-
-        if video_records:
-            # no-object control: query of a target absent from every sampled frame.
-            absent_query = None
-            for obj_id, queries in expressions_by_obj.items():
-                if obj_id not in objects or obj_id in {r.target_id for r in video_records}:
-                    continue
-                if not any(presence_at(obj_id, frame) for frame in sampled):
-                    absent_query = queries[0]
-                    break
-            no_object_query = (
-                f"{absent_query} (not present)" if absent_query else f"{video_records[0].query} (not present)"
-            )
-            records.append(
-                MaskTrainingRecord(
-                    sample_id=f"ryvos.{split_name}.{video_id}.no_object",
-                    media_id=f"ryvos.{video_id}",
-                    media_type="video",
-                    media_path=str(jpg_root / video_id),
-                    frame_indices=tuple(int(frame) for frame in sampled),
-                    mask_paths=(None,) * len(sampled),
-                    target_presence=(False,) * len(sampled),
-                    anchor_position=0,
-                    split=split_name,
-                    query=no_object_query,
-                    target_id=None,
-                    control_kind="no_object",
-                )
-            )
-            records.append(
-                MaskTrainingRecord(
-                    sample_id=f"ryvos.{split_name}.{video_id}.empty_query",
-                    media_id=f"ryvos.{video_id}",
-                    media_type="video",
-                    media_path=str(jpg_root / video_id),
-                    frame_indices=tuple(int(frame) for frame in sampled),
-                    mask_paths=(None,) * len(sampled),
-                    target_presence=(False,) * len(sampled),
-                    anchor_position=0,
-                    split=split_name,
-                    query="",
-                    target_id=None,
-                    control_kind="empty_query",
-                )
-            )
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        for _video_id, video_records, pair in pool.map(_process_video, tasks, chunksize=4):
+            records.extend(video_records)
+            if pair is not None:
+                pairs.append(pair)
     return records, pairs, len(video_ids)
 
 
@@ -417,6 +463,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--refcoco-root", type=Path, required=True)
     parser.add_argument("--ryvos-extracted-root", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=16)
     args = parser.parse_args(argv)
 
     artifact_root = args.artifact_root
@@ -431,6 +478,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 artifact_root / "masks" / args.variant,
                 args.max_rows,
                 args.seed,
+                args.workers,
             )
             manifest = MaskTrainingManifest(tuple(records), tuple(pairs))
             output_dir = artifact_root / "manifests" / f"image_{args.variant}"
@@ -448,6 +496,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             records, pairs, source_videos = build_video_manifest(
                 extracted_root, split_name, args.max_videos, args.seed,
                 artifact_root / "masks" / "ryvos",
+                args.workers,
             )
             manifest = MaskTrainingManifest(tuple(records), tuple(pairs))
             output_dir = artifact_root / "manifests" / "video_ryvos"
