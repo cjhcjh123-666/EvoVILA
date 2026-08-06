@@ -8,6 +8,7 @@ contribute only inside the explicit training scope.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -42,6 +43,7 @@ from llava.evo_seg.losses import (
     compute_segmentation_loss,
     dice_loss,
     objectness_loss,
+    query_swap_margin_loss,
 )
 from llava.evo_seg.sam2_adapter import RGBFrameBatch, SAM2ImageFeatureProvider
 from llava.evo_seg.training import (
@@ -97,6 +99,35 @@ def _setup_distributed(device_text: str) -> Tuple[torch.device, int, int]:
         return device, rank, world_size
     device = torch.device(device_text)
     return device, 0, 1
+
+
+def _timestamp() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class TrainingLogger:
+    """Structured, flushed training log written to stdout and a file."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.path = output_dir / "train.log"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a", encoding="utf-8")
+
+    def step(self, **fields: Any) -> None:
+        line = " ".join(f"{key}={value}" for key, value in fields.items())
+        full = f"[{_timestamp()}] {line}"
+        print(full, flush=True)
+        self._handle.write(full + "\n")
+        self._handle.flush()
+
+    def message(self, text: str) -> None:
+        full = f"[{_timestamp()}] {text}"
+        print(full, flush=True)
+        self._handle.write(full + "\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
 
 
 def _sync_gradients(optimizer: torch.optim.Optimizer, world_size: int) -> None:
@@ -156,12 +187,28 @@ def _query_span_mask(
             if tuple(row[start : start + len(candidate)]) == candidate:
                 spans.add((start, start + len(candidate)))
     if len(spans) != 1:
-        raise ValueError(f"query must map to exactly one token span, found {sorted(spans)}")
-    start, end = next(iter(spans))
-    try:
-        seg_position = row.index(seg_id, end)
-    except ValueError as error:
-        raise ValueError("[SEG] token must appear after the query span") from error
+        # Robust fallback: locate the [SEG] token and the template colon that
+        # separates the instruction prefix from the referring expression.
+        seg_positions = [index for index, token in enumerate(row) if token == seg_id]
+        if not seg_positions:
+            raise ValueError("[SEG] token missing from the prompt")
+        seg_position = seg_positions[-1]
+        newline_id = _token_ids(tokenizer, "\n")[0]
+        newline_positions = [index for index in range(seg_position) if row[index] == newline_id]
+        colon_id = _token_ids(tokenizer, ":")[0]
+        colon_positions = [index for index in range(seg_position) if row[index] == colon_id]
+        if newline_positions:
+            start = newline_positions[-1] + 1
+        elif colon_positions:
+            start = colon_positions[-1] + 1
+        else:
+            raise ValueError("no instruction boundary token found before [SEG]")
+    else:
+        start, end = next(iter(spans))
+        try:
+            seg_position = row.index(seg_id, end)
+        except ValueError as error:
+            raise ValueError("[SEG] token must appear after the query span") from error
     mask = torch.zeros_like(input_ids, dtype=torch.bool)
     mask[0, start : seg_position + 1] = True
     return mask, seg_position
@@ -392,6 +439,7 @@ def _run(
     device_text: str,
     retention_image_paths: Optional[List[str]] = None,
     retention_video_dir: Optional[str] = None,
+    video_manifest_dir_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     device, rank, world_size = _setup_distributed(device_text)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -526,7 +574,17 @@ def _run(
     if not train_positives:
         raise ValueError("manifest contains no positive training records")
     task = str(config.get("task", "image"))
-    sample_loader = _video_sample if task == "video" else _image_sample
+    mixed = task == "mixed"
+    if mixed and int(training.get("fixed_subset", 0)) > 0:
+        raise ValueError("mixed training requires fixed_subset=0")
+    image_manifest_dir = manifest_dir
+    video_manifest_dir = Path(video_manifest_dir_text) if video_manifest_dir_text else (
+        manifest_dir if task == "video" else None
+    )
+    if mixed and video_manifest_dir is None:
+        raise ValueError("mixed training requires --video-manifest-dir")
+    image_loader = _image_sample
+    video_loader = _video_sample
     rng = random.Random(seed)
     fixed_subset = int(training.get("fixed_subset", 0))
     if fixed_subset > 0:
@@ -534,56 +592,133 @@ def _run(
         train_positives = train_positives[:fixed_subset]
         print(f"[train] fixed-subset overfit on {len(train_positives)} samples", flush=True)
 
+    if video_manifest_dir is not None and (video_manifest_dir / "train.jsonl").exists():
+        video_train_records = [
+            json.loads(line)
+            for line in (video_manifest_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        video_train_records = [record for record in video_train_records if record["control_kind"] != "empty_query"]
+        train_positives.extend(record for record in video_train_records if record["control_kind"] == "positive")
+        train_negatives.extend(record for record in video_train_records if record["control_kind"] == "no_object")
+
+    image_positives = [record for record in train_positives if record["media_type"] == "image"]
+    video_positives = [record for record in train_positives if record["media_type"] == "video"]
+    image_negatives = [record for record in train_negatives if record["media_type"] == "image"]
+    video_negatives = [record for record in train_negatives if record["media_type"] == "video"]
+    records_by_id = {record["sample_id"]: record for record in train_records}
+    if video_manifest_dir is not None and (video_manifest_dir / "train.jsonl").exists():
+        records_by_id.update(
+            {
+                record["sample_id"]: record
+                for record in video_train_records
+            }
+        )
+
+    pair_map: Dict[str, str] = {}
+    for pairs_path in (
+        image_manifest_dir / "train.pairs.jsonl",
+        video_manifest_dir / "train.pairs.jsonl" if video_manifest_dir is not None else None,
+    ):
+        if pairs_path is None or not pairs_path.exists():
+            continue
+        for line in pairs_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            pair = json.loads(line)
+            left, right = pair["left_sample_id"], pair["right_sample_id"]
+            pair_map[left] = right
+            pair_map[right] = left
+    print(f"[train] pools image_pos={len(image_positives)} video_pos={len(video_positives)} "
+          f"image_neg={len(image_negatives)} video_neg={len(video_negatives)} "
+          f"pairs={len(pair_map) // 2}", flush=True)
+
     steps = int(training.get("steps", 500))
     log_every = int(training.get("log_every", 10))
     eval_every = int(training.get("eval_every", 25))
     loss_weights = dict(config.get("loss_weights", {"bce": 1.0, "dice": 1.0, "objectness": 0.1}))
     refined_weight = float(training.get("refined_mask_weight", 0.5))
     hidden_layer = int(training.get("hidden_layer", -1))
+    mix_video_ratio = float(training.get("mix_video_ratio", 0.5))
+    no_object_ratio = float(training.get("no_object_ratio", 0.15))
+    swap_prob = float(training.get("swap_prob", 0.25))
+    swap_weight = float(loss_weights.get("query_swap", 0.0))
+    seg_loss_weights = dict(loss_weights)
+    seg_loss_weights.pop("query_swap", None)
 
+    def run_forward(sample: Dict[str, Any], sample_task: str, with_loss: bool = True):
+        query_states = adapter.extract_query_states_training(
+            sample["input_ids"],
+            sample["media"],
+            sample["media_config"],
+            sample["query_mask"],
+            sample["attention_mask"],
+            hidden_layer=hidden_layer,
+        )
+        seg_positions = (
+            sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
+        ).to(dtype=torch.long, device=device)
+        projected = projector(query_states.states, query_states.mask, seg_positions)
+        dense = provider.encode_frames(sample["rgb"])
+        batch = GroundingBatch(
+            query_states=projected,
+            query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
+            dense_features=dense.features,
+            frame_mask=dense.frame_mask,
+            target_masks=sample["target_mask"] if with_loss else None,
+            target_presence=sample["target_presence"] if with_loss else None,
+            sample_ids=(sample["sample_id"],),
+        )
+        result = capability(batch, {"enabled": True, "task": sample_task})
+        losses = compute_segmentation_loss(result, batch, seg_loss_weights) if with_loss else None
+        return result, losses, batch
+
+    logger = TrainingLogger(output_dir) if rank == 0 else None
     history: List[Dict[str, Any]] = []
+    history_file = output_dir / "train_history.jsonl"
     if rank == 0:
-        print("[train] starting training loop", flush=True)
+        if history_file.exists():
+            history_file.unlink()
+        logger.message(
+            f"starting training loop task={task} steps={steps} world_size={world_size} "
+            f"mix_video_ratio={mix_video_ratio} no_object_ratio={no_object_ratio} "
+            f"swap_prob={swap_prob} swap_weight={swap_weight}"
+        )
     optimizer.zero_grad(set_to_none=True)
     step = 0
-    progress = tqdm(range(steps), desc=f"T1 rank{rank}", disable=(rank != 0), ncols=100)
+    progress = tqdm(
+        range(steps),
+        desc=f"T3 rank{rank}" if mixed else f"T{1 if task == 'image' else 2} rank{rank}",
+        disable=(rank != 0),
+        ncols=110,
+    )
     while step < steps:
-        if fixed_subset > 0:
-            positive = train_positives[(step * world_size + rank) % len(train_positives)]
+        if mixed:
+            if rng.random() < mix_video_ratio:
+                sample_task, pos_pool, neg_pool = "video", video_positives, video_negatives
+            else:
+                sample_task, pos_pool, neg_pool = "image", image_positives, image_negatives
+            if neg_pool and rng.random() < no_object_ratio:
+                record = rng.choice(neg_pool)
+            else:
+                record = rng.choice(pos_pool)
         else:
-            positive = rng.choice(train_positives)
-        sample = sample_loader(positive, model, tokenizer, template, seg_id, device)
+            sample_task = task
+            if fixed_subset > 0:
+                record = train_positives[(step * world_size + rank) % len(train_positives)]
+            elif train_negatives and rng.random() < no_object_ratio:
+                record = rng.choice(train_negatives)
+            else:
+                record = rng.choice(train_positives)
+        loader = video_loader if sample_task == "video" else image_loader
+        sample = loader(record, model, tokenizer, template, seg_id, device)
         decoder.train()
         projector.train()
-        autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
-        with autocast, seg_training_active(True):
-            query_states = adapter.extract_query_states_training(
-                sample["input_ids"],
-                sample["media"],
-                sample["media_config"],
-                sample["query_mask"],
-                sample["attention_mask"],
-                hidden_layer=hidden_layer,
-            )
-            seg_positions = (
-                sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
-            ).to(dtype=torch.long, device=device)
-            projected = projector(query_states.states, query_states.mask, seg_positions)
-            dense = provider.encode_frames(sample["rgb"])
-            batch = GroundingBatch(
-                query_states=projected,
-                query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-                dense_features=dense.features,
-                frame_mask=dense.frame_mask,
-                target_masks=sample["target_mask"],
-                target_presence=sample["target_presence"],
-                sample_ids=(sample["sample_id"],),
-            )
-            result = capability(batch, {"enabled": True, "task": "image"})
-            losses = compute_segmentation_loss(result, batch, loss_weights)
+        swap_value = 0.0
+        with torch.autocast(device_type="cuda", dtype=torch.float16), seg_training_active(True):
+            result, losses, batch = run_forward(sample, sample_task)
             total_loss = losses["total"]
-            refined = None
-            if sam2_mask_decoder_trainable and sample["control_kind"] == "positive":
+            if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
                 anchor_rgb = RGBFrameBatch(
                     frames=sample["rgb"].frames[:, :1],
                     frame_mask=torch.ones(1, 1, dtype=torch.bool),
@@ -599,11 +734,35 @@ def _run(
                     + dice_loss(refined, refined_target, refined_valid)
                 ) * refined_weight
                 total_loss = total_loss + refined_loss
+            if (
+                swap_weight > 0
+                and record["control_kind"] == "positive"
+                and rng.random() < swap_prob
+            ):
+                partner_id = pair_map.get(record["sample_id"])
+                partner = records_by_id.get(partner_id) if partner_id else None
+                if partner is not None:
+                    swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
+                    swapped_result, _, _ = run_forward(swapped_sample, sample_task)
+                    valid_swap = batch.frame_mask[:, None, :]
+                    if batch.target_presence is not None:
+                        valid_swap = batch.target_presence & valid_swap
+                    swap_loss = query_swap_margin_loss(
+                        result.mask_logits,
+                        swapped_result.mask_logits,
+                        batch.target_masks,
+                        valid_swap,
+                        margin=float(training.get("swap_margin", 0.1)),
+                    )
+                    total_loss = total_loss + swap_loss * swap_weight
+                    swap_value = float(swap_loss.detach().item())
         total_loss.backward()
         _sync_gradients(optimizer, world_size)
-        torch.nn.utils.clip_grad_norm_(
-            [parameter for group in optimizer.param_groups for parameter in group["params"]],
-            float(training.get("grad_clip", 1.0)),
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for group in optimizer.param_groups for parameter in group["params"]],
+                float(training.get("grad_clip", 1.0)),
+            ).item()
         )
         nan_grads = [
             f"{name}:{parameter.grad.abs().max().item():.3e}"
@@ -612,7 +771,7 @@ def _run(
             if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
         ]
         if nan_grads:
-            print(f"[train] step {step} NON-FINITE grads: {nan_grads[:5]}", flush=True)
+            logger.message(f"step {step} NON-FINITE grads: {nan_grads[:5]}")
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         nan_params = [
@@ -622,13 +781,13 @@ def _run(
             if not torch.isfinite(parameter).all()
         ]
         if nan_params:
-            print(f"[train] step {step} NON-FINITE params: {nan_params[:5]}", flush=True)
-        if not torch.isfinite(total_loss).all():
-            print(f"[train] step {step} NON-FINITE loss {float(total_loss.detach())}", flush=True)
+            logger.message(f"step {step} NON-FINITE params: {nan_params[:5]}")
 
         anchor_iou = _mask_iou(
             result.mask_logits[0, 0, 0].detach(),
-            sample["target_mask"][0, 0, 0].detach() if sample["control_kind"] == "positive" else torch.zeros(1, 1, dtype=torch.bool, device=device),
+            sample["target_mask"][0, 0, 0].detach()
+            if record["control_kind"] == "positive"
+            else torch.zeros(1, 1, dtype=torch.bool, device=device),
         )
         progress.update(1)
         progress.set_postfix(
@@ -636,57 +795,77 @@ def _run(
             iou=anchor_iou,
             bce=float(losses["bce"].detach().item()),
             dice=float(losses["dice"].detach().item()),
+            swap=swap_value,
         )
-        history.append(
-            {
-                "step": step,
-                "loss": float(total_loss.detach().item()),
-                "bce": float(losses["bce"].detach().item()),
-                "dice": float(losses["dice"].detach().item()),
-                "anchor_iou": anchor_iou,
-                "control_kind": sample["control_kind"],
-                "sample_id": sample["sample_id"],
-            }
-        )
-        if rank == 0 and (step % log_every == 0 or step == steps - 1):
-            latest = history[-1]
-            print(
-                f"step {step:4d} loss {latest['loss']:.4f} bce {latest['bce']:.4f} "
-                f"dice {latest['dice']:.4f} iou {latest['anchor_iou']:.3f} "
-                f"kind {latest['control_kind']}"
+        history_entry = {
+            "step": step,
+            "source": sample_task,
+            "loss": float(total_loss.detach().item()),
+            "bce": float(losses["bce"].detach().item()),
+            "dice": float(losses["dice"].detach().item()),
+            "objectness": float(losses["objectness"].detach().item()),
+            "temporal": float(losses["temporal"].detach().item()),
+            "swap": swap_value,
+            "anchor_iou": anchor_iou,
+            "control_kind": record["control_kind"],
+            "sample_id": record["sample_id"],
+        }
+        if rank == 0:
+            history.append(history_entry)
+            with history_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(history_entry) + "\n")
+            remaining = progress.format_dict.get("remaining")
+            logger.step(
+                step=step,
+                total=steps,
+                source=sample_task,
+                sample=record["sample_id"],
+                kind=record["control_kind"],
+                loss=round(history_entry["loss"], 4),
+                bce=round(history_entry["bce"], 4),
+                dice=round(history_entry["dice"], 4),
+                objectness=round(history_entry["objectness"], 4),
+                temporal=round(history_entry["temporal"], 4),
+                swap=round(history_entry["swap"], 4),
+                iou=round(anchor_iou, 3),
+                lr=optimizer.param_groups[0]["lr"],
+                gnorm=round(grad_norm, 3),
+                eta=remaining,
             )
-        if rank == 0 and (step % eval_every == 0 or step == steps - 1) and val_records:
-            decoder.eval()
-            projector.eval()
-            ious = []
-            for record in rng.sample([r for r in val_records if r["control_kind"] == "positive"], min(10, len(val_records))):
-                sample = sample_loader(record, model, tokenizer, template, seg_id, device)
-                with torch.no_grad(), seg_training_active(True), torch.autocast(
-                    device_type="cuda", dtype=torch.float16
-                ):
-                    query_states = adapter.extract_query_states_training(
-                        sample["input_ids"], sample["media"], sample["media_config"],
-                        sample["query_mask"], sample["attention_mask"], hidden_layer=hidden_layer,
+        if rank == 0 and (step % eval_every == 0 or step == steps - 1):
+            for eval_task, eval_dir, eval_loader in (
+                ("image", image_manifest_dir, image_loader),
+                ("video", video_manifest_dir, video_loader),
+            ):
+                if eval_dir is None or not (eval_dir / "val.jsonl").exists():
+                    continue
+                eval_records = [
+                    json.loads(line)
+                    for line in (eval_dir / "val.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip() and json.loads(line)["control_kind"] == "positive"
+                ]
+                if not eval_records:
+                    continue
+                decoder.eval()
+                projector.eval()
+                ious = []
+                for eval_record in rng.sample(eval_records, min(10, len(eval_records))):
+                    eval_sample = eval_loader(eval_record, model, tokenizer, template, seg_id, device)
+                    with torch.no_grad(), seg_training_active(True), torch.autocast(
+                        device_type="cuda", dtype=torch.float16
+                    ):
+                        eval_result, _, _ = run_forward(eval_sample, eval_task, with_loss=False)
+                    ious.append(
+                        _mask_iou(
+                            eval_result.mask_logits[0, 0, 0].detach(),
+                            eval_sample["target_mask"][0, 0, 0].detach(),
+                        )
                     )
-                    seg_positions = (
-                        sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
-                    ).to(dtype=torch.long, device=device)
-                    projected = projector(query_states.states, query_states.mask, seg_positions)
-                    dense = provider.encode_frames(sample["rgb"])
-                    batch = GroundingBatch(
-                        query_states=projected,
-                        query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-                        dense_features=dense.features,
-                        frame_mask=dense.frame_mask,
-                        sample_ids=(sample["sample_id"],),
-                    )
-                    result = capability(batch, {"enabled": True, "task": "image"})
-                ious.append(
-                    _mask_iou(result.mask_logits[0, 0, 0].detach(), sample["target_mask"][0, 0, 0].detach())
+                val_iou = float(np.mean(ious)) if ious else 0.0
+                logger.message(
+                    f"eval step={step} task={eval_task} val_iou={val_iou:.4f} n={len(ious)}"
                 )
-            val_iou = float(np.mean(ious)) if ious else 0.0
-            print(f"step {step:4d} val IoU (n={len(ious)}): {val_iou:.3f}", flush=True)
-            history[-1]["val_iou"] = val_iou
+                history_entry.setdefault("eval", {})[eval_task] = round(val_iou, 4)
         step += 1
     progress.close()
 
@@ -782,6 +961,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--retention-image-paths", nargs="+", default=None)
     parser.add_argument("--retention-video-dir", default=None)
+    parser.add_argument("--video-manifest-dir", default=None)
     args = parser.parse_args(argv)
     config_path = args.config.expanduser().resolve()
     output_dir = args.output.expanduser().resolve()
@@ -802,6 +982,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         device_text=args.device,
         retention_image_paths=args.retention_image_paths,
         retention_video_dir=args.retention_video_dir,
+        video_manifest_dir_text=args.video_manifest_dir,
     )
     return 0
 
