@@ -220,6 +220,58 @@ def _image_sample(
     }
 
 
+def _video_sample(
+    record: Dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    template: str,
+    seg_id: int,
+    device: torch.device,
+):
+    media_dir = Path(record["media_path"])
+    frame_indices = [int(index) for index in record["frame_indices"]]
+    frames = []
+    for index in frame_indices:
+        with Image.open(media_dir / f"{index:05d}.jpg") as handle:
+            frames.append(handle.convert("RGB"))
+    query = record["query"]
+    instruction = template.format(query=query) + " [SEG]"
+    conversation = [{"from": "human", "value": frames + [instruction]}]
+    input_ids, media, media_config, attention_mask = _prepare_inputs(model, conversation)
+    query_mask, seg_position = _query_span_mask(input_ids, tokenizer, query, seg_id)
+    array = np.stack([np.asarray(frame, dtype=np.uint8).copy() for frame in frames])
+    rgb_frames = torch.from_numpy(array).permute(0, 3, 1, 2).contiguous().unsqueeze(0)
+    rgb = RGBFrameBatch(
+        frames=rgb_frames,
+        frame_mask=torch.ones(1, len(frames), dtype=torch.bool),
+        sample_ids=(record["sample_id"],),
+    )
+    target_masks = []
+    for mask_path in record["mask_paths"]:
+        tensor, present = _target_tensor(mask_path, device)
+        if not present:
+            tensor = torch.zeros(1, 1, 1, 1, 1, dtype=torch.bool, device=device)
+        target_masks.append(tensor)
+    if target_masks:
+        target = torch.cat(target_masks, dim=2)
+    else:
+        target = torch.zeros(1, 1, len(frames), 1, 1, dtype=torch.bool, device=device)
+    presence = torch.tensor(record["target_presence"], dtype=torch.bool, device=device).view(1, 1, -1)
+    return {
+        "input_ids": input_ids,
+        "media": media,
+        "media_config": media_config,
+        "attention_mask": attention_mask,
+        "query_mask": query_mask,
+        "seg_position": seg_position,
+        "rgb": rgb,
+        "target_mask": target,
+        "target_presence": presence,
+        "sample_id": record["sample_id"],
+        "control_kind": record["control_kind"],
+    }
+
+
 def _probe_conversations(model: Any, probe_media: Dict[str, Any]) -> List[Dict[str, Any]]:
     image_paths = probe_media["image_paths"]
     video_dir = probe_media["video_dir"]
@@ -473,6 +525,8 @@ def _run(
     train_negatives = [record for record in train_records if record["control_kind"] == "no_object"]
     if not train_positives:
         raise ValueError("manifest contains no positive training records")
+    task = str(config.get("task", "image"))
+    sample_loader = _video_sample if task == "video" else _image_sample
     rng = random.Random(seed)
     fixed_subset = int(training.get("fixed_subset", 0))
     if fixed_subset > 0:
@@ -498,7 +552,7 @@ def _run(
             positive = train_positives[(step * world_size + rank) % len(train_positives)]
         else:
             positive = rng.choice(train_positives)
-        sample = _image_sample(positive, model, tokenizer, template, seg_id, device)
+        sample = sample_loader(positive, model, tokenizer, template, seg_id, device)
         decoder.train()
         projector.train()
         autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -530,8 +584,15 @@ def _run(
             total_loss = losses["total"]
             refined = None
             if sam2_mask_decoder_trainable and sample["control_kind"] == "positive":
-                refined = _sam2_refine_trainable(provider, sample["rgb"], result.mask_logits, device)
-                refined_target = _align_targets_for_refine(sample["target_mask"], refined, device)
+                anchor_rgb = RGBFrameBatch(
+                    frames=sample["rgb"].frames[:, :1],
+                    frame_mask=torch.ones(1, 1, dtype=torch.bool),
+                    sample_ids=(sample["sample_id"],),
+                )
+                refined = _sam2_refine_trainable(
+                    provider, anchor_rgb, result.mask_logits[:, :, :1], device
+                )
+                refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
                 refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
                 refined_loss = (
                     binary_mask_loss(refined, refined_target, refined_valid)
@@ -599,7 +660,7 @@ def _run(
             projector.eval()
             ious = []
             for record in rng.sample([r for r in val_records if r["control_kind"] == "positive"], min(10, len(val_records))):
-                sample = _image_sample(record, model, tokenizer, template, seg_id, device)
+                sample = sample_loader(record, model, tokenizer, template, seg_id, device)
                 with torch.no_grad(), seg_training_active(True), torch.autocast(
                     device_type="cuda", dtype=torch.float16
                 ):

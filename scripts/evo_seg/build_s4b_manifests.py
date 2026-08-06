@@ -237,6 +237,7 @@ def build_video_manifest(
     split_name: str,
     max_videos: Optional[int],
     seed: int,
+    mask_root: Path,
 ) -> Tuple[List[MaskTrainingRecord], List[QuerySwapPair], int]:
     if split_name == "train":
         meta_path = extracted_root / "train/meta.json"
@@ -320,7 +321,19 @@ def build_video_manifest(
                 continue
             presence = tuple(presence_at(obj_id, frame) for frame in sampled)
             if is_train:
-                mask_paths = tuple(str(ann_root / video_id / f"{int(frame):05d}.png") for frame in sampled)
+                pixel_value = pixel_map.get(obj_id)
+                saved_paths = []
+                for frame in sampled:
+                    source = ann_root / video_id / f"{int(frame):05d}.png"
+                    destination = mask_root / split_name / f"{video_id}_{obj_id}_{int(frame):05d}.png"
+                    if pixel_value is None:
+                        raise RuntimeError(f"pixel map missing object {obj_id} in video {video_id}")
+                    array = np.asarray(Image.open(source).convert("L"))
+                    binary = ((array == pixel_value).astype(np.uint8)) * 255
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    Image.fromarray(binary).save(destination)
+                    saved_paths.append(str(destination))
+                mask_paths = tuple(saved_paths)
             else:
                 mask_paths = tuple(
                     str(ann_root / video_id / obj_id / f"{int(frame):05d}.png") for frame in sampled
@@ -433,7 +446,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         extracted_root = args.ryvos_extracted_root
         for split_name in ("train", "val"):
             records, pairs, source_videos = build_video_manifest(
-                extracted_root, split_name, args.max_videos, args.seed
+                extracted_root, split_name, args.max_videos, args.seed,
+                artifact_root / "masks" / "ryvos",
             )
             manifest = MaskTrainingManifest(tuple(records), tuple(pairs))
             output_dir = artifact_root / "manifests" / "video_ryvos"
