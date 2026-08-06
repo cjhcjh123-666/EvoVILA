@@ -40,14 +40,22 @@ def _masked_mean(values: Tensor, valid: Tensor) -> Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1)
 
 
-def binary_mask_loss(logits: Tensor, targets: Tensor, valid: Tensor) -> Tensor:
-    """Compute per-object/frame BCE, excluding invalid entries."""
+def binary_mask_loss(logits: Tensor, targets: Tensor, valid: Tensor, positive_weight: float = 1.0) -> Tensor:
+    """Compute per-object/frame BCE, excluding invalid entries.
+
+    ``positive_weight > 1`` up-weights positive target pixels, which is useful
+    for small-object segmentation where plain BCE collapses to background.
+    """
 
     if logits.ndim != 5 or not logits.is_floating_point():
         raise ValueError("logits must be a floating tensor with shape [B,N,T,H,W]")
+    if positive_weight < 0 or not math.isfinite(positive_weight):
+        raise ValueError("positive_weight must be finite and non-negative")
     valid = _validate_valid(valid, tuple(logits.shape[:3]))
     targets = _align_targets(logits, targets)
-    per_entry = F.binary_cross_entropy_with_logits(logits, targets, reduction="none").mean(dim=(-1, -2))
+    per_entry = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none", pos_weight=torch.tensor(positive_weight, device=logits.device)
+    ).mean(dim=(-1, -2))
     return _masked_mean(per_entry, valid)
 
 
@@ -161,7 +169,12 @@ def compute_segmentation_loss(
         raise ValueError("target_presence is required for segmentation losses")
 
     zero = result.mask_logits.sum() * 0
-    bce = binary_mask_loss(result.mask_logits, batch.target_masks, valid)
+    bce = binary_mask_loss(
+        result.mask_logits,
+        batch.target_masks,
+        valid,
+        positive_weight=float(weights.get("bce_positive_weight", 1.0)),
+    )
     dice = dice_loss(result.mask_logits, batch.target_masks, valid)
     objectness = objectness_loss(result.object_logits, batch.target_presence, batch.frame_mask)
     query_swap = zero

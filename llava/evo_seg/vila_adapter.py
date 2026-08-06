@@ -151,6 +151,7 @@ class VILASegmentationAdapter:
         query_token_mask: Tensor,
         attention_mask: Optional[Tensor],
         hidden_layer: int,
+        enable_grad: bool = False,
     ) -> tuple[QueryStateBatch, float]:
         # Keep package import free of VILA model initialization.  The model
         # package has heavyweight registrations, so resolve this hook only
@@ -163,7 +164,8 @@ class VILASegmentationAdapter:
         capture = FusionCapture()
         _synchronize(input_ids)
         started = time.perf_counter()
-        with torch.no_grad(), fusion_observation(capture):
+        grad_context = torch.enable_grad() if enable_grad else torch.no_grad()
+        with grad_context, fusion_observation(capture):
             outputs = self.model(
                 input_ids=input_ids,
                 media=media,
@@ -191,6 +193,34 @@ class VILASegmentationAdapter:
         # Query masks refer to original padded token positions.  The provenance
         # object performs the media expansion and left/right padding mapping.
         return capture.gather_query_states(selected_hidden, query_token_mask), elapsed_ms
+
+    def extract_query_states_training(
+        self,
+        input_ids: Tensor,
+        media: Optional[Mapping[str, Any]],
+        media_config: Optional[Mapping[str, Any]],
+        query_token_mask: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        hidden_layer: int = -1,
+    ) -> QueryStateBatch:
+        """Gradient-enabled query extraction for S4b training only.
+
+        Ordinary requests continue to use :meth:`extract_query_states`, which
+        runs under ``torch.no_grad()``.  Trainable LoRA/[SEG]/projector
+        parameters need gradients through the frozen VILA forward, so this
+        training entry keeps autograd enabled.
+        """
+
+        query_states, _ = self._extract_query_states_with_timing(
+            input_ids,
+            media,
+            media_config,
+            query_token_mask,
+            attention_mask,
+            hidden_layer,
+            enable_grad=True,
+        )
+        return query_states
 
     def extract_query_states(
         self,

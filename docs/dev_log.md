@@ -394,3 +394,26 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **完成内容**：运行 S4a 目标测试、全部 EvoVILA-Seg no-weight 回归、扩展/VILA hook/smoke 静态编译、独立进程导入隔离和 Git 空白检查。
 - **遇到的问题**：完整 pytest 仅报告既有依赖的 17 条 deprecation/future warnings，无测试失败；流式工具的短等待窗口曾截断 pytest 末尾显示，因此使用持续轮询重新取得完整退出码与摘要。
 - **解决方案**：目标测试为 16 passed；完整回归为 88 passed、17 warnings；`py_compile`、`llava.model`/external SAM2 import isolation 和 `git diff --check` 均通过。未读取数据、加载权重、运行 GPU 或启动训练。
+
+### 2026-08-06 — S4b T1 图像 overfit 实现与运行
+
+- **完成内容**：按确认的方案实现 S4b 训练栈并跑 T1 RefCOCO overfit。数据侧：
+  `scripts/evo_seg/build_s4b_manifests.py` 从 RefCOCO parquet + COCO2017 栅格化目标掩码，构建
+  RefCOCO train/val manifest（train 1,391 条 / 60 swap，val 1,401 条 / 85 swap），并从 Ref-YT-VOS
+  构建视频 manifest（train 466 条 / 76 swap，val 490 条 / 78 swap），全部通过冻结的
+  `MaskTrainingManifest` 校验；镜像的每帧联合掩码使用调色板像素值，构建器先推断像素→目标映射。
+- **训练侧**：`llava/evo_seg/training.py` 增加 LoRA（最后 8 层 q/v，fp32 参数，仅训练作用域生效）、
+  `[SEG]` 可训练注入 embedding（不改冻结词表）、`GroundingProjector`（保留完整多 token query 状态并
+  追加 `[SEG]` token）；`vila_adapter.py` 增加可微 `extract_query_states_training`（普通路径仍 no_grad）；
+  `scripts/evo_seg/train_s4b.py` 实现 T1 训练循环：冻结 VILA 基座 + 可训练 decoder/[SEG]/projector/LoRA/
+  SAM2 mask decoder，loss 为 BCE(+正样本加权)/Dice/objectness + SAM2 精修 mask 的 BCE+Dice，
+  训练前后跑 text/single-image/multi-image/video 四条 retention probe（精确 logits）。
+- **遇到的问题**：首轮 500 步随机抽样未过拟合（IoU≈0）；定位为 ① pooling 把多 token query 语义压成
+  同质表示（同图不同 query 余弦 0.96），改为保留完整 query states + `[SEG]` token；② 小目标正负像素
+  不平衡导致模型塌缩到全背景，加入 `bce_positive_weight=5` 后单样本 anchor IoU 峰值达到 0.5+。
+- **解决方案**：配置 `configs/evo_seg/s4b_t1_image.yaml` 固定 16 样本、800 步、lr 3e-4；正式 T1 已在
+  1×A800 后台运行。所有训练产物（manifest/mask/checkpoint/summary/retention）都在
+  `evo_artifacts/datasets/s4b` 与 `evo_artifacts/results/s4b`，仓库外。
+- **验证**：新增 `tests/test_evo_seg_training_policy.py`（5 passed），全套 no-weight 回归 93 passed、
+  `py_compile`、导入隔离、`git diff --check` 均通过；冒烟训练中 VILA 基座可训参数为 0，
+  四条 retention probe 训练前后 `max_abs_diff=0.0`。

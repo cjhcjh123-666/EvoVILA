@@ -1,6 +1,6 @@
 # Implementation Guide - EvoVILA-Seg Spatiotemporal Segmentation
 
-> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S1_COMPLETE; S2_IMAGE_PLUMBING_COMPLETE; S3_VIDEO_PLUMBING_COMPLETE; S4A_MASK_DATA_CONTRACT_DESIGN_FROZEN; S4B_TRAINING_DEFERRED
+> Generated: 2026-08-05 | Strategy: extend the VILA baseline through opt-in adapters | Status: S0-S3_COMPLETE; S4A_MASK_DATA_CONTRACT_DESIGN_FROZEN; S4B_T1_IMAGE_OVERFIT_IMPLEMENTED_AND_RUNNING; S4B_T2_VIDEO_DEFERRED
 > Basis: user-confirmed architecture and repository audit. A formal `docs/idea_report.md` Part 3 does not yet exist, so benchmark-scale training remains outside this implementation milestone.
 
 ## 1 Original Project And Scope
