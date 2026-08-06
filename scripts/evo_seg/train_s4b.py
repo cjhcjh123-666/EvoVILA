@@ -45,7 +45,7 @@ from llava.evo_seg.losses import (
     objectness_loss,
     query_swap_margin_loss,
 )
-from llava.evo_seg.sam2_adapter import RGBFrameBatch, SAM2ImageFeatureProvider
+from llava.evo_seg.sam2_adapter import DenseFeatureBatch, RGBFrameBatch, SAM2ImageFeatureProvider
 from llava.evo_seg.training import (
     GroundingProjector,
     SegEmbeddingInjector,
@@ -86,6 +86,25 @@ def _timed_call(device: torch.device, function):
     value = function()
     _synchronize(device)
     return value, (time.perf_counter() - started) * 1000.0
+
+
+def _upsample_dense(dense: DenseFeatureBatch, scale: int) -> DenseFeatureBatch:
+    """Optionally raise the decoder spatial resolution (SAM2 stride 16 -> finer)."""
+
+    if scale <= 1:
+        return dense
+    batch_size, frames, channels, height, width = dense.features.shape
+    features = F.interpolate(
+        dense.features.reshape(batch_size * frames, channels, height, width),
+        scale_factor=float(scale),
+        mode="bilinear",
+        align_corners=False,
+    ).reshape(batch_size, frames, channels, height * scale, width * scale)
+    return DenseFeatureBatch(
+        features=features,
+        frame_mask=dense.frame_mask,
+        diagnostics=dense.diagnostics,
+    )
 
 
 def _setup_distributed(device_text: str) -> Tuple[torch.device, int, int]:
@@ -638,6 +657,7 @@ def _run(
     eval_every = int(training.get("eval_every", 25))
     loss_weights = dict(config.get("loss_weights", {"bce": 1.0, "dice": 1.0, "objectness": 0.1}))
     refined_weight = float(training.get("refined_mask_weight", 0.5))
+    spatial_scale = int(decoder_config.get("spatial_scale", 1))
     hidden_layer = int(training.get("hidden_layer", -1))
     mix_video_ratio = float(training.get("mix_video_ratio", 0.5))
     no_object_ratio = float(training.get("no_object_ratio", 0.15))
@@ -660,6 +680,7 @@ def _run(
         ).to(dtype=torch.long, device=device)
         projected = projector(query_states.states, query_states.mask, seg_positions)
         dense = provider.encode_frames(sample["rgb"])
+        dense = _upsample_dense(dense, spatial_scale)
         batch = GroundingBatch(
             query_states=projected,
             query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),

@@ -53,6 +53,7 @@ from scripts.evo_seg.train_s4b import (
     _rgb_batch,
     _sam2_refine_trainable,
     _target_tensor,
+    _upsample_dense,
     _video_sample,
 )
 
@@ -122,7 +123,7 @@ def _eval_image_record(
             sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
         ).to(dtype=torch.long, device=device)
         projected = projector(query_states.states, query_states.mask, seg_positions)
-        dense = provider.encode_frames(sample["rgb"])
+        dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
         result = capability(
             GroundingBatch(
                 query_states=projected,
@@ -339,6 +340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     )
     hidden_layer = int(training.get("hidden_layer", -1))
+    spatial_scale = int(decoder_config.get("spatial_scale", 1))
 
     import llava
 
