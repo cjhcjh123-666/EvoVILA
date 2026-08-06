@@ -417,3 +417,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **验证**：新增 `tests/test_evo_seg_training_policy.py`（5 passed），全套 no-weight 回归 93 passed、
   `py_compile`、导入隔离、`git diff --check` 均通过；冒烟训练中 VILA 基座可训参数为 0，
   四条 retention probe 训练前后 `max_abs_diff=0.0`。
+
+### 2026-08-06 — S4b T1 多卡加速与正式 overfit 结果
+
+- **完成内容**：`train_s4b.py` 增加 torchrun 8×A800 分布式训练（每 rank 独立采样、梯度 all-reduce）
+  与 tqdm 实时进度条（loss/bce/dice/iou/ETA）。800 步从单卡 ~70 分钟降到 8 卡 ~5 分钟；
+  1600 步约 6.5 分钟，每步 8 样本（8 rank × batch 1），8 卡各占 ~7.3GB 显存。
+- **遇到的问题**：`seg_embedding` 参数初始在 CPU 导致 nccl all-reduce 报
+  "No backend type associated with device type cpu"，已移到对应 CUDA 设备。
+- **解决方案**：正式 T1 配置固定 16 个 RefCOCO 正样本、1600 步、lr 3e-4、`bce_positive_weight=5`，
+  SAM2 mask decoder 可训。结果（`evo_artifacts/results/s4b/t1_image_overfit_v4/summary.json`）：
+  train anchor IoU 峰值 0.585、末 200 步均值 0.571（200/200 步 ≥0.5）、loss 2.43→1.93、
+  val IoU 0.037→0.067；四条 retention probe 训练前后精确相等（max_abs_diff=0.0）。
+- **验证**：8 卡 DDP 4 步冒烟与 1600 步正式跑均通过；提交 `7e82f4d` 包含
+  training.py/losses.py/vila_adapter.py/build_s4b_manifests.py/train_s4b.py/配置/测试/文档，
+  仓库内无本机绝对路径，未 push。
