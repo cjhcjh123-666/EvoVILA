@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+from tqdm import tqdm
 
 from llava.evo_seg.capability import SegmentationCapability
 from llava.evo_seg.contracts import GroundingBatch
@@ -64,13 +65,12 @@ def _load_config(path: Path) -> Dict[str, Any]:
 
 def _load_records(manifest_dir: Path) -> List[Dict[str, Any]]:
     records = []
-    for name in ("val.jsonl", "train.jsonl"):
-        path = manifest_dir / name
-        if not path.exists():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
+    path = manifest_dir / "val.jsonl"
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
     return records
 
 
@@ -261,12 +261,12 @@ def _eval_video_record(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--vila-model", type=Path, required=True)
-    parser.add_argument("--sam2-source-root", type=Path, required=True)
-    parser.add_argument("--sam2-checkpoint", type=Path, required=True)
-    parser.add_argument("--manifest-dir", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--vila-model", type=Path)
+    parser.add_argument("--sam2-source-root", type=Path)
+    parser.add_argument("--sam2-checkpoint", type=Path)
+    parser.add_argument("--manifest-dir", type=Path)
     parser.add_argument("--video-manifest-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -310,6 +310,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         print(json.dumps(summary, indent=2))
         return 0
+
+    required = {
+        "config": args.config,
+        "checkpoint": args.checkpoint,
+        "vila_model": args.vila_model,
+        "sam2_source_root": args.sam2_source_root,
+        "sam2_checkpoint": args.sam2_checkpoint,
+        "manifest_dir": args.manifest_dir,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise SystemExit(f"missing required arguments: {', '.join(missing)}")
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -404,7 +416,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_samples:
         image_records = image_records[: args.max_samples]
     image_records = image_records[args.shard_index :: args.shard_count]
-    for record in image_records:
+    for record in tqdm(image_records, desc=f"image eval shard {args.shard_index}", ncols=100):
         try:
             result = _eval_image_record(
                 record, model, tokenizer, template, seg_id, device,
@@ -423,7 +435,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_samples:
         video_records = video_records[: args.max_samples]
     video_records = video_records[args.shard_index :: args.shard_count]
-    for record in video_records:
+    for record in tqdm(video_records, desc=f"video eval shard {args.shard_index}", ncols=100):
         try:
             result = _eval_video_record(
                 record, model, tokenizer, template, seg_id, device,
