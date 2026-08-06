@@ -455,3 +455,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **遇到的问题**：视频每步含多帧，单步 1.7 it/s 慢于图像 4.3 it/s，1600 步约 20 分钟，可接受。
 - **解决方案**：anchor 帧 IoU 稳定上升且 val 泛化为正，说明 decoder+SAM2 微调栈对视频有效；
   query-swap / no-object 控制与正式 J&F 评测留到 T3（小规模正式训练）按已冻结契约执行。
+
+### 2026-08-06 — S4b T3 混合训练实现并启动（tmux 实时日志）
+
+- **完成内容**：`train_s4b.py` 增加 task=mixed（按 `mix_video_ratio` 混抽图像/视频，`no_object_ratio`
+  混入 no-object 负控，`swap_prob` 触发同媒体 query-swap margin loss）、双 val manifest 评测、
+  `TrainingLogger` 每步结构化落盘 `train.log` + `train_history.jsonl`（step/loss/bce/dice/objectness/
+  temporal/swap/iou/lr/gnorm/eta/source/sample），tqdm 终端进度条。新增
+  `configs/evo_seg/s4b_t3_mixed.yaml`（4000 步、lr 2e-4、query_swap 0.1、temporal 0.1、
+  bce_positive_weight 5、SAM2 mask decoder 可训）。
+- **遇到的问题**：随机 query 在 prompt 内分词与单独分词不一致导致 span 定位失败；指令模板改为
+  `...referring expression:\n{query}`（`\n` 在 Llama 分词器是独立 token），`_query_span_mask`
+  增加按 `\n`/`:` 边界的稳健回退。
+- **解决方案**：T3 混合 8 步冒烟通过（双 val 评测、swap/no-object 路径正常、retention 精确）。
+  正式 T3 已在 tmux 会话 `s4b_t3` 内以 8×A800 启动（4000 步，约 2 小时），输出目录
+  `evo_artifacts/results/s4b/t3_mixed_v1`；提交 `fb3bad2`。
