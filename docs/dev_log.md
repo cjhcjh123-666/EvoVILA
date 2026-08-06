@@ -432,3 +432,15 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **验证**：8 卡 DDP 4 步冒烟与 1600 步正式跑均通过；提交 `7e82f4d` 包含
   training.py/losses.py/vila_adapter.py/build_s4b_manifests.py/train_s4b.py/配置/测试/文档，
   仓库内无本机绝对路径，未 push。
+
+### 2026-08-06 — S4b T2 视频 anchor 训练实现
+
+- **完成内容**：`build_s4b_manifests.py` 视频分支为 train 正样本按目标像素提取并保存二值掩码
+  （调色板联合掩码 → 目标层），`mask_paths` 指向这些二值掩码；`train_s4b.py` 增加 `_video_sample`
+  loader（采样帧 PIL 序列 → VILA 多帧输入 + `[SEG]`、SAM2 多帧特征、目标 [B,N,T,H,W]/presence），
+  图像/视频共用训练循环，SAM2 精修只作用于 anchor 帧（T=1 切片）。新增
+  `configs/evo_seg/s4b_t2_video.yaml`（temporal consistency loss 0.1）。
+- **遇到的问题**：仓库配置将 retention 路径清空后，T2 冒烟因空 image_paths 报 IndexError；
+  已改为训练时通过 `--retention-image-paths/--retention-video-dir` 显式传入。
+- **解决方案**：T2 冒烟（4 步、8 卡）通过，anchor IoU 第 3 步已到 0.47，retention 精确；
+  正式 T2 1600 步在 8×A800 后台运行。提交 `3b40842`（视频 loader/二值掩码/T2 配置）。
