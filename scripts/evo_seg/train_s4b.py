@@ -709,7 +709,7 @@ def _run(
     step = 0
     progress = tqdm(
         range(steps),
-        desc=f"T3 rank{rank}" if mixed else f"T{1 if task == 'image' else 2} rank{rank}",
+        desc=f"S4b rank{rank}",
         disable=(rank != 0),
         ncols=110,
     )
