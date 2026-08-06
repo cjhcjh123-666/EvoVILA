@@ -444,3 +444,14 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
   已改为训练时通过 `--retention-image-paths/--retention-video-dir` 显式传入。
 - **解决方案**：T2 冒烟（4 步、8 卡）通过，anchor IoU 第 3 步已到 0.47，retention 精确；
   正式 T2 1600 步在 8×A800 后台运行。提交 `3b40842`（视频 loader/二值掩码/T2 配置）。
+
+### 2026-08-06 — S4b T2 正式视频 anchor overfit 结果
+
+- **完成内容**：正式 T2 完成（1600 步、8×A800、~20.5 分钟），结果见
+  `evo_artifacts/results/s4b/t2_video_overfit/summary.json`：train anchor IoU 峰值 0.676、
+  末 200 步均值 0.545（200/200 步 ≥0.5）、loss 2.38→1.85、dice 0.48；
+  val（held-out Ref-YT-VOS 视频）IoU 约 0.24-0.31，明显优于 T1 图像的 0.067；
+  四条 retention probe 训练前后精确相等（max_abs_diff=0.0）；峰值显存 10.2GB/卡。
+- **遇到的问题**：视频每步含多帧，单步 1.7 it/s 慢于图像 4.3 it/s，1600 步约 20 分钟，可接受。
+- **解决方案**：anchor 帧 IoU 稳定上升且 val 泛化为正，说明 decoder+SAM2 微调栈对视频有效；
+  query-swap / no-object 控制与正式 J&F 评测留到 T3（小规模正式训练）按已冻结契约执行。
