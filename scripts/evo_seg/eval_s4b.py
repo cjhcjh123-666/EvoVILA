@@ -271,7 +271,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--merge-only", action="store_true")
     args = parser.parse_args(argv)
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    if args.merge_only:
+        image_shards = sorted(args.output.glob("image_results.*.json"))
+        video_shards = sorted(args.output.glob("video_results.*.json"))
+        image_results: List[Dict[str, Any]] = []
+        video_results: List[Dict[str, Any]] = []
+        for shard in image_shards:
+            image_results.extend(json.loads(shard.read_text(encoding="utf-8")))
+        for shard in video_shards:
+            video_results.extend(json.loads(shard.read_text(encoding="utf-8")))
+
+        def mean_metric(results: List[Dict[str, Any]], key: str) -> Optional[float]:
+            values = [item[key] for item in results if key in item and item[key] is not None]
+            return float(np.mean(values)) if values else None
+
+        summary = {
+            "image": {
+                "samples": len(image_results),
+                "mean_coarse_iou": mean_metric(image_results, "coarse_iou"),
+                "mean_refined_iou": mean_metric(image_results, "refined_iou"),
+            },
+            "video": {
+                "samples": len(video_results),
+                "mean_anchor_iou": mean_metric(video_results, "anchor_iou"),
+                "mean_j": mean_metric(video_results, "j"),
+                "mean_f": mean_metric(video_results, "f"),
+                "mean_jf": mean_metric(video_results, "jf"),
+            },
+        }
+        (args.output / "image_results.json").write_text(json.dumps(image_results, indent=2), encoding="utf-8")
+        (args.output / "video_results.json").write_text(json.dumps(video_results, indent=2), encoding="utf-8")
+        (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(json.dumps(summary, indent=2))
+        return 0
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -365,6 +403,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ]
     if args.max_samples:
         image_records = image_records[: args.max_samples]
+    image_records = image_records[args.shard_index :: args.shard_count]
     for record in image_records:
         try:
             result = _eval_image_record(
@@ -383,6 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ]
     if args.max_samples:
         video_records = video_records[: args.max_samples]
+    video_records = video_records[args.shard_index :: args.shard_count]
     for record in video_records:
         try:
             result = _eval_video_record(
@@ -411,10 +451,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "mean_jf": mean_metric(video_results, "jf"),
         },
     }
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "image_results.json").write_text(json.dumps(image_results, indent=2), encoding="utf-8")
-    (args.output / "video_results.json").write_text(json.dumps(video_results, indent=2), encoding="utf-8")
-    (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (args.output / f"image_results.{args.shard_index}.json").write_text(json.dumps(image_results, indent=2), encoding="utf-8")
+    (args.output / f"video_results.{args.shard_index}.json").write_text(json.dumps(video_results, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     return 0
 
