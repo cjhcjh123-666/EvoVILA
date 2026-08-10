@@ -470,3 +470,44 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
 - **解决方案**：T3 混合 8 步冒烟通过（双 val 评测、swap/no-object 路径正常、retention 精确）。
   正式 T3 已在 tmux 会话 `s4b_t3` 内以 8×A800 启动（4000 步，约 2 小时），输出目录
   `evo_artifacts/results/s4b/t3_mixed_v1`；提交 `fb3bad2`。
+
+### 2026-08-10 — S4b T4 全量数据基线训练完成 + 稳定性修复（8×A800）
+
+- **完成内容**：T4 全量基线训练（`configs/evo_seg/s4b_t4_mixed.yaml`，10000 步）最终完成，
+  结果见 `evo_artifacts/results/s4b/t4_mixed_v3/summary.json`：final train anchor IoU **0.514**、
+  final loss **1.32**、峰值显存 **~14GB/卡**；四条 retention probe 训练前后全部精确相等
+  （max_abs_diff=0.0，VILA 文本/单图/多图/视频能力零损伤）。正式 val 评测与反捷径评测
+  （no-object 幻觉率 + query-swap）于 17:23 以 8 shard 并行启动，结果待汇总。
+- **遇到的问题（一串事故链，三个 bug 叠加）**：
+  1. 坏视频帧：Ref-YT-VOS 某视频第 5 帧为 1×1 损坏帧，`np.stack` 直接崩；non-finite 跳过
+     只包住 forward 未包住数据加载。
+  2. resume 特有 bug：循环变量 `adapter` 覆盖模块级 `VILASegmentationAdapter`（Python 变量泄漏）。
+  3. fp16 数值不稳定：VILA 前向 fp16 下 projector 偶发溢出 → `query_states` 非有限 → 训练步
+     跳过（老 run 17% 浪费）；且检测到 NaN 梯度后仍执行 `optimizer.step()`，把 NaN 写进
+     LoRA 参数造成污染；eval 块未保护（坏 val 样本直接崩整个 run）；`logger` 在非 rank-0 为
+     None 未判空。
+- **解决方案**：分割栈（projector/decoder/loss）全部切 fp32（VILA 前向保持 fp16）、
+  NaN 梯度跳过该步 optimizer、logger 判空、eval 块 try/except、query/dense states `nan_to_num`
+  兜底、视频帧统一 resize。修复后跳过率从 17% 降到 ~2-3%。提交：`ef30fc4`（帧归一化+坏样本
+  跳过）、`8838854`（resume 变量泄漏）、`a255581`（nan_to_num+eval 保护）、`4710f7b`
+  （fp32 分割栈+NaN 梯度跳过+logger 判空）。周期 checkpoint + resume（`5b6250e`）在 T4
+  崩于 step 6019 时从 step-5000 checkpoint 续跑，实战验证有效。
+
+### 2026-08-10 — M2 数据全量就绪：合并 manifest + 类别感知 no-object 负样本
+
+- **完成内容**：RefCOCO/RefCOCO+/RefCOCOg 全量 manifest 与合并训练集
+  （`image_merged_all/train.jsonl`：**321,333** 图，refcoco 120,626 + refcocoplus 120,193 +
+  refcocog 80,514）、**167,655** 条类别感知 no-object 负样本（train N=3/图、val N=5/图，
+  查询类别不在目标图 COCO 类别集合中，合并 train+val 两份 instances 标注避免漏类别）、
+  46,998 对 query-swap。修复 sample_id 冲突（三个变体原先都硬编码 `refcoco.*`，合并时互相
+  覆盖导致只剩 14 万条）。提交：`c720348`（负样本生成器+训练集成）、`9719864`（合并脚本+
+  反捷径评测协议+sample_id 前缀）、`feed5b0`（T5 合并数据训练配置）。
+
+### 2026-08-10 — S4b T5 合并数据主模型训练启动（论文主模型）
+
+- **完成内容**：`configs/evo_seg/s4b_t5_merged.yaml`（10000 步、lr 2e-4、lora_lr 4e-4、
+  mix_video_ratio 0.25、no_object_ratio 0.25、swap_prob 0.25、bce_positive_weight 8.0）在 tmux
+  `s4b_t5_v1` 以 8×A800 启动，输出 `evo_artifacts/results/s4b/t5_merged_v1`。池子：
+  image_pos=321,327 / video_pos=6,345 / image_neg=167,658 / video_neg=3,438 / pairs=46,998。
+  稳态 ~2.25s/it（节点负载 ~300 导致慢于 T4 的 0.6s/step），ETA ~6h。这是论文要写的
+  anti-shortcut 主模型：全量三个图集 + 系统负样本 + query-swap。
