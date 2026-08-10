@@ -723,27 +723,27 @@ def _run(
     seg_loss_weights.pop("query_swap", None)
 
     def run_forward(sample: Dict[str, Any], sample_task: str, with_loss: bool = True):
-        query_states = adapter.extract_query_states_training(
-            sample["input_ids"],
-            sample["media"],
-            sample["media_config"],
-            sample["query_mask"],
-            sample["attention_mask"],
-            hidden_layer=hidden_layer,
-        )
+        # VILA forward stays fp16 (frozen and heavy); the segmentation stack
+        # (projector/decoder/losses) runs in fp32 to avoid fp16 overflow.
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            query_states = adapter.extract_query_states_training(
+                sample["input_ids"],
+                sample["media"],
+                sample["media_config"],
+                sample["query_mask"],
+                sample["attention_mask"],
+                hidden_layer=hidden_layer,
+            )
         seg_positions = (
             sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
         ).to(dtype=torch.long, device=device)
-        # fp16 stability guard: VILA hidden states can intermittently overflow
-        # to inf for outlier inputs. Replace non-finite entries with zero so the
-        # step trains through instead of being skipped or crashing the run.
-        query_states_raw = query_states.states
+        query_states_raw = query_states.states.to(dtype=torch.float32)
         if not torch.isfinite(query_states_raw).all():
             query_states_raw = torch.nan_to_num(query_states_raw, nan=0.0, posinf=0.0, neginf=0.0)
         projected = projector(query_states_raw, query_states.mask, seg_positions)
         dense = provider.encode_frames(sample["rgb"])
         dense = _upsample_dense(dense, spatial_scale)
-        dense_features = dense.features
+        dense_features = dense.features.to(dtype=torch.float32)
         if not torch.isfinite(dense_features).all():
             dense_features = torch.nan_to_num(dense_features, nan=0.0, posinf=0.0, neginf=0.0)
         batch = GroundingBatch(
@@ -804,9 +804,11 @@ def _run(
         projector.train()
         swap_value = 0.0
         try:
-            with torch.autocast(device_type="cuda", dtype=torch.float16), seg_training_active(True):
+            with seg_training_active(True):
                 result, losses, batch = run_forward(sample, sample_task)
                 total_loss = losses["total"]
+                if not torch.isfinite(total_loss):
+                    raise ValueError("non-finite total loss")
                 if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
                     anchor_rgb = RGBFrameBatch(
                         frames=sample["rgb"].frames[:, :1],
@@ -847,7 +849,11 @@ def _run(
                         swap_value = float(swap_loss.detach().item())
         except (ValueError, RuntimeError) as error:
             message = str(error)
-            if "must contain only finite values" not in message and "Sizes of tensors must match" not in message:
+            if (
+                "must contain only finite values" not in message
+                and "Sizes of tensors must match" not in message
+                and "non-finite total loss" not in message
+            ):
                 raise
             if logger is not None:
                 logger.message(
@@ -858,12 +864,6 @@ def _run(
             continue
         total_loss.backward()
         _sync_gradients(optimizer, world_size)
-        grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(
-                [parameter for group in optimizer.param_groups for parameter in group["params"]],
-                float(training.get("grad_clip", 1.0)),
-            ).item()
-        )
         nan_grads = [
             f"{name}:{parameter.grad.abs().max().item():.3e}"
             for group in optimizer.param_groups
@@ -871,7 +871,18 @@ def _run(
             if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
         ]
         if nan_grads:
-            logger.message(f"step {step} NON-FINITE grads: {nan_grads[:5]}")
+            if logger is not None:
+                logger.message(f"step {step} NON-FINITE grads, skipping optimizer step: {nan_grads[:5]}")
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            progress.update(1)
+            continue
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for group in optimizer.param_groups for parameter in group["params"]],
+                float(training.get("grad_clip", 1.0)),
+            ).item()
+        )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         nan_params = [
@@ -881,7 +892,8 @@ def _run(
             if not torch.isfinite(parameter).all()
         ]
         if nan_params:
-            logger.message(f"step {step} NON-FINITE params: {nan_params[:5]}")
+            if logger is not None:
+                logger.message(f"step {step} NON-FINITE params: {nan_params[:5]}")
 
         anchor_iou = _mask_iou(
             result.mask_logits[0, 0, 0].detach(),
@@ -952,9 +964,7 @@ def _run(
                 for eval_record in rng.sample(eval_records, min(10, len(eval_records))):
                     try:
                         eval_sample = eval_loader(eval_record, model, tokenizer, template, seg_id, device)
-                        with torch.no_grad(), seg_training_active(True), torch.autocast(
-                            device_type="cuda", dtype=torch.float16
-                        ):
+                        with torch.no_grad(), seg_training_active(True):
                             eval_result, _, _ = run_forward(eval_sample, eval_task, with_loss=False)
                     except (ValueError, RuntimeError):
                         continue
