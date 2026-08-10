@@ -865,7 +865,7 @@ def _run(
         total_loss.backward()
         _sync_gradients(optimizer, world_size)
         nan_grads = [
-            f"{name}:{parameter.grad.abs().max().item():.3e}"
+            f"{group['name']}:{parameter.grad.abs().max().item():.3e}"
             for group in optimizer.param_groups
             for parameter in group["params"]
             if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
