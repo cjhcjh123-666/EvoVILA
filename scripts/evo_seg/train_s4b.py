@@ -329,6 +329,16 @@ def _video_sample(
         tensor, present = _target_tensor(mask_path, device)
         if not present:
             tensor = torch.zeros(1, 1, 1, 1, 1, dtype=torch.bool, device=device)
+        # Normalize each mask to the common frame size: Ref-YT-VOS contains a
+        # few corrupt 1x1 masks that otherwise break torch.cat along frames
+        # (frames are already resized to max_w x max_h above).
+        if tensor.shape[-2] != max_h or tensor.shape[-1] != max_w:
+            tensor = (
+                torch.nn.functional.interpolate(
+                    tensor.float().squeeze(2), size=(max_h, max_w), mode="nearest"
+                )
+                > 0.5
+            ).unsqueeze(2)
         target_masks.append(tensor)
     if target_masks:
         target = torch.cat(target_masks, dim=2)
