@@ -604,8 +604,8 @@ def _run(
         with torch.no_grad():
             seg_injector.seg_embedding.copy_(state["seg_embedding"].to(device))
         for name, adapters in lora_adapters.items():
-            for index, adapter in enumerate(adapters):
-                adapter.load_state_dict(state["lora"][name][index])
+            for index, lora_adapter in enumerate(adapters):
+                lora_adapter.load_state_dict(state["lora"][name][index])
         if sam2_mask_decoder_trainable and state.get("sam2_mask_decoder"):
             with torch.no_grad():
                 for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters():
