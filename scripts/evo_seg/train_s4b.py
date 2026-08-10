@@ -459,6 +459,7 @@ def _run(
     retention_image_paths: Optional[List[str]] = None,
     retention_video_dir: Optional[str] = None,
     video_manifest_dir_text: Optional[str] = None,
+    no_object_image_manifest: Optional[Path] = None,
     resume: bool = False,
 ) -> Dict[str, Any]:
     device, rank, world_size = _setup_distributed(device_text)
@@ -621,6 +622,17 @@ def _run(
     train_records = [record for record in train_records if record["control_kind"] != "empty_query"]
     train_positives = [record for record in train_records if record["control_kind"] == "positive"]
     train_negatives = [record for record in train_records if record["control_kind"] == "no_object"]
+    if no_object_image_manifest is not None:
+        extra_negatives = [
+            json.loads(line)
+            for line in no_object_image_manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        existing_ids = {record["sample_id"] for record in train_negatives}
+        train_negatives.extend(
+            record for record in extra_negatives if record["sample_id"] not in existing_ids
+        )
+        print(f"[train] loaded {len(extra_negatives)} no-object image negatives", flush=True)
     if not train_positives:
         raise ValueError("manifest contains no positive training records")
     task = str(config.get("task", "image"))
@@ -1051,6 +1063,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--retention-image-paths", nargs="+", default=None)
     parser.add_argument("--retention-video-dir", default=None)
     parser.add_argument("--video-manifest-dir", default=None)
+    parser.add_argument("--no-object-image-manifest", default=None, help="extra no_object image records (jsonl)")
     args = parser.parse_args(argv)
     config_path = args.config.expanduser().resolve()
     output_dir = args.output.expanduser().resolve()
@@ -1072,6 +1085,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         retention_image_paths=args.retention_image_paths,
         retention_video_dir=args.retention_video_dir,
         video_manifest_dir_text=args.video_manifest_dir,
+        no_object_image_manifest=(
+            Path(args.no_object_image_manifest).expanduser().resolve()
+            if args.no_object_image_manifest
+            else None
+        ),
         resume=args.resume,
     )
     return 0
