@@ -298,8 +298,20 @@ def _video_sample(
     frame_indices = [int(index) for index in record["frame_indices"]]
     frames = []
     for index in frame_indices:
-        with Image.open(media_dir / f"{index:05d}.jpg") as handle:
-            frames.append(handle.convert("RGB"))
+        frame_path = media_dir / f"{index:05d}.jpg"
+        try:
+            with Image.open(frame_path) as handle:
+                frames.append(handle.convert("RGB"))
+        except Exception:
+            # Missing or corrupt frame: substitute a neutral dark frame so the
+            # batch stays aligned with the manifest's sampled frame indices.
+            frames.append(Image.new("RGB", (1, 1), (0, 0, 0)))
+    # Normalize all frames to a common spatial size (some Ref-YT-VOS videos
+    # contain a corrupt 1x1 frame that breaks np.stack otherwise).
+    max_h = max(frame.height for frame in frames)
+    max_w = max(frame.width for frame in frames)
+    if any((frame.width, frame.height) != (max_w, max_h) for frame in frames):
+        frames = [frame.resize((max_w, max_h), Image.BILINEAR) for frame in frames]
     query = record["query"]
     instruction = template.format(query=query) + " [SEG]"
     conversation = [{"from": "human", "value": frames + [instruction]}]
@@ -824,12 +836,13 @@ def _run(
                         )
                         total_loss = total_loss + swap_loss * swap_weight
                         swap_value = float(swap_loss.detach().item())
-        except ValueError as error:
-            if "must contain only finite values" not in str(error):
+        except (ValueError, RuntimeError) as error:
+            message = str(error)
+            if "must contain only finite values" not in message and "Sizes of tensors must match" not in message:
                 raise
             if logger is not None:
                 logger.message(
-                    f"step {step} SKIPPED non-finite sample {record['sample_id']} ({sample_task})"
+                    f"step {step} SKIPPED bad sample {record['sample_id']} ({sample_task}): {message[:120]}"
                 )
             step += 1
             progress.update(1)
