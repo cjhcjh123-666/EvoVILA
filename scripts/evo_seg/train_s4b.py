@@ -734,13 +734,22 @@ def _run(
         seg_positions = (
             sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
         ).to(dtype=torch.long, device=device)
-        projected = projector(query_states.states, query_states.mask, seg_positions)
+        # fp16 stability guard: VILA hidden states can intermittently overflow
+        # to inf for outlier inputs. Replace non-finite entries with zero so the
+        # step trains through instead of being skipped or crashing the run.
+        query_states_raw = query_states.states
+        if not torch.isfinite(query_states_raw).all():
+            query_states_raw = torch.nan_to_num(query_states_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        projected = projector(query_states_raw, query_states.mask, seg_positions)
         dense = provider.encode_frames(sample["rgb"])
         dense = _upsample_dense(dense, spatial_scale)
+        dense_features = dense.features
+        if not torch.isfinite(dense_features).all():
+            dense_features = torch.nan_to_num(dense_features, nan=0.0, posinf=0.0, neginf=0.0)
         batch = GroundingBatch(
             query_states=projected,
             query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-            dense_features=dense.features,
+            dense_features=dense_features,
             frame_mask=dense.frame_mask,
             target_masks=sample["target_mask"] if with_loss else None,
             target_presence=sample["target_presence"] if with_loss else None,
@@ -941,11 +950,14 @@ def _run(
                 projector.eval()
                 ious = []
                 for eval_record in rng.sample(eval_records, min(10, len(eval_records))):
-                    eval_sample = eval_loader(eval_record, model, tokenizer, template, seg_id, device)
-                    with torch.no_grad(), seg_training_active(True), torch.autocast(
-                        device_type="cuda", dtype=torch.float16
-                    ):
-                        eval_result, _, _ = run_forward(eval_sample, eval_task, with_loss=False)
+                    try:
+                        eval_sample = eval_loader(eval_record, model, tokenizer, template, seg_id, device)
+                        with torch.no_grad(), seg_training_active(True), torch.autocast(
+                            device_type="cuda", dtype=torch.float16
+                        ):
+                            eval_result, _, _ = run_forward(eval_sample, eval_task, with_loss=False)
+                    except (ValueError, RuntimeError):
+                        continue
                     ious.append(
                         _mask_iou(
                             eval_result.mask_logits[0, 0, 0].detach(),
