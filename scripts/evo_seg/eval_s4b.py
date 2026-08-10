@@ -112,6 +112,7 @@ def _eval_image_record(
     projector: GroundingProjector,
     provider: SAM2ImageFeatureProvider,
     hidden_layer: int,
+    spatial_scale: int,
 ) -> Dict[str, Any]:
     sample = _image_sample(record, model, tokenizer, template, seg_id, device)
     with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -275,6 +276,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--merge-only", action="store_true")
+    parser.add_argument("--skip-video", action="store_true", help="only evaluate image records")
     args = parser.parse_args(argv)
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -422,30 +424,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             result = _eval_image_record(
                 record, model, tokenizer, template, seg_id, device,
-                adapter, capability, projector, provider, hidden_layer,
+                adapter, capability, projector, provider, hidden_layer, spatial_scale,
             )
         except Exception as error:  # noqa: BLE001
             result = {"sample_id": record["sample_id"], "error": str(error)}
         image_results.append(result)
 
     video_manifest_dir = args.video_manifest_dir or args.manifest_dir
-    video_records = [
-        record
-        for record in _load_records(video_manifest_dir)
-        if record["control_kind"] == "positive" and record["media_type"] == "video"
-    ]
-    if args.max_samples:
-        video_records = video_records[: args.max_samples]
-    video_records = video_records[args.shard_index :: args.shard_count]
-    for record in tqdm(video_records, desc=f"video eval shard {args.shard_index}", ncols=100):
-        try:
-            result = _eval_video_record(
-                record, model, tokenizer, template, seg_id, device,
-                adapter, capability, projector, provider, propagator, hidden_layer,
-            )
-        except Exception as error:  # noqa: BLE001
-            result = {"sample_id": record["sample_id"], "error": str(error)}
-        video_results.append(result)
+    if not args.skip_video:
+        video_records = [
+            record
+            for record in _load_records(video_manifest_dir)
+            if record["control_kind"] == "positive" and record["media_type"] == "video"
+        ]
+        if args.max_samples:
+            video_records = video_records[: args.max_samples]
+        video_records = video_records[args.shard_index :: args.shard_count]
+        for record in tqdm(video_records, desc=f"video eval shard {args.shard_index}", ncols=100):
+            try:
+                result = _eval_video_record(
+                    record, model, tokenizer, template, seg_id, device,
+                    adapter, capability, projector, provider, propagator, hidden_layer,
+                )
+            except Exception as error:  # noqa: BLE001
+                result = {"sample_id": record["sample_id"], "error": str(error)}
+            video_results.append(result)
 
     def mean_metric(results: List[Dict[str, Any]], key: str) -> Optional[float]:
         values = [item[key] for item in results if key in item and item[key] is not None]
@@ -466,7 +469,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
     }
     (args.output / f"image_results.{args.shard_index}.json").write_text(json.dumps(image_results, indent=2), encoding="utf-8")
-    (args.output / f"video_results.{args.shard_index}.json").write_text(json.dumps(video_results, indent=2), encoding="utf-8")
+    if not args.skip_video:
+        (args.output / f"video_results.{args.shard_index}.json").write_text(json.dumps(video_results, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     return 0
 
