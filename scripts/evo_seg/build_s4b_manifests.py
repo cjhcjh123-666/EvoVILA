@@ -91,7 +91,7 @@ def _process_image_row(task) -> Tuple[int, List[MaskTrainingRecord]]:
             continue
         records.append(
             MaskTrainingRecord(
-                sample_id=f"refcoco.{row['ref_id']}.s{sentence_index}",
+                sample_id=f"{variant}.{row['ref_id']}.s{sentence_index}",
                 media_id=f"coco.{image_id}",
                 media_type="image",
                 media_path=str(image_path),
@@ -185,7 +185,7 @@ def build_image_manifest(
         media_path = positive_by_image[no_object_media][0].media_path
         records.append(
             MaskTrainingRecord(
-                sample_id=f"refcoco.no_object.{no_object_media}",
+                sample_id=f"{variant}.no_object.{no_object_media}",
                 media_id=f"coco.{no_object_media}",
                 media_type="image",
                 media_path=media_path,
@@ -201,7 +201,7 @@ def build_image_manifest(
         )
         records.append(
             MaskTrainingRecord(
-                sample_id=f"refcoco.empty_query.{no_object_media}",
+                sample_id=f"{variant}.empty_query.{no_object_media}",
                 media_id=f"coco.{no_object_media}",
                 media_type="image",
                 media_path=media_path,
