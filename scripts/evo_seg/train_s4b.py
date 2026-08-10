@@ -459,6 +459,7 @@ def _run(
     retention_image_paths: Optional[List[str]] = None,
     retention_video_dir: Optional[str] = None,
     video_manifest_dir_text: Optional[str] = None,
+    resume: bool = False,
 ) -> Dict[str, Any]:
     device, rank, world_size = _setup_distributed(device_text)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -506,14 +507,19 @@ def _run(
         probe_media["image_paths"] = retention_image_paths
     if retention_video_dir:
         probe_media["video_dir"] = retention_video_dir
-    baseline_logits = None
-    if rank == 0:
-        probe_conversations = _probe_conversations(model, probe_media)
-        print("[train] building retention baselines", flush=True)
-        baseline_logits = [_probe_logits(model, conversation) for conversation in probe_conversations]
-        print("[train] retention baselines captured", flush=True)
-        torch.save(baseline_logits, output_dir / "retention_baseline.pt")
     output_dir.mkdir(parents=True, exist_ok=True)
+    baseline_logits = None
+    baseline_path = output_dir / "retention_baseline.pt"
+    if rank == 0:
+        if resume and baseline_path.exists():
+            baseline_logits = torch.load(baseline_path, map_location="cpu")
+            print("[train] loaded existing retention baselines for resume", flush=True)
+        else:
+            probe_conversations = _probe_conversations(model, probe_media)
+            print("[train] building retention baselines", flush=True)
+            baseline_logits = [_probe_logits(model, conversation) for conversation in probe_conversations]
+            print("[train] retention baselines captured", flush=True)
+            torch.save(baseline_logits, baseline_path)
     provider = SAM2ImageFeatureProvider(
         {
             "source_root": str(sam2_source_root),
@@ -576,6 +582,31 @@ def _run(
         ),
         weight_decay=float(training.get("weight_decay", 0.0)),
     )
+    start_step = 0
+    resume_ckpt = output_dir / "checkpoint_latest.pt"
+    if resume and resume_ckpt.exists():
+        state = torch.load(resume_ckpt, map_location="cpu")
+        decoder.load_state_dict(state["decoder"])
+        projector.load_state_dict(state["projector"])
+        with torch.no_grad():
+            seg_injector.seg_embedding.copy_(state["seg_embedding"].to(device))
+        for name, adapters in lora_adapters.items():
+            for index, adapter in enumerate(adapters):
+                adapter.load_state_dict(state["lora"][name][index])
+        if sam2_mask_decoder_trainable and state.get("sam2_mask_decoder"):
+            with torch.no_grad():
+                for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters():
+                    if name in state["sam2_mask_decoder"]:
+                        parameter.copy_(state["sam2_mask_decoder"][name].to(device))
+        if state.get("optimizer"):
+            optimizer.load_state_dict(state["optimizer"])
+        start_step = int(state.get("step", 0))
+        print(f"[train] resumed from step {start_step} ({resume_ckpt})", flush=True)
+    elif resume:
+        print(
+            f"[train] WARNING --resume requested but {resume_ckpt} does not exist; starting fresh",
+            flush=True,
+        )
 
     train_records = [
         json.loads(line)
@@ -655,6 +686,7 @@ def _run(
     steps = int(training.get("steps", 500))
     log_every = int(training.get("log_every", 10))
     eval_every = int(training.get("eval_every", 25))
+    save_every = int(training.get("save_every", 1000))
     loss_weights = dict(config.get("loss_weights", {"bce": 1.0, "dice": 1.0, "objectness": 0.1}))
     refined_weight = float(training.get("refined_mask_weight", 0.5))
     spatial_scale = int(decoder_config.get("spatial_scale", 1))
@@ -698,7 +730,7 @@ def _run(
     history: List[Dict[str, Any]] = []
     history_file = output_dir / "train_history.jsonl"
     if rank == 0:
-        if history_file.exists():
+        if history_file.exists() and start_step == 0:
             history_file.unlink()
         logger.message(
             f"starting training loop task={task} steps={steps} world_size={world_size} "
@@ -706,13 +738,15 @@ def _run(
             f"swap_prob={swap_prob} swap_weight={swap_weight}"
         )
     optimizer.zero_grad(set_to_none=True)
-    step = 0
+    step = start_step
     progress = tqdm(
         range(steps),
         desc=f"S4b rank{rank}",
         disable=(rank != 0),
         ncols=110,
     )
+    if start_step > 0:
+        progress.update(start_step)
     while step < steps:
         if mixed:
             if rng.random() < mix_video_ratio:
@@ -736,47 +770,58 @@ def _run(
         decoder.train()
         projector.train()
         swap_value = 0.0
-        with torch.autocast(device_type="cuda", dtype=torch.float16), seg_training_active(True):
-            result, losses, batch = run_forward(sample, sample_task)
-            total_loss = losses["total"]
-            if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
-                anchor_rgb = RGBFrameBatch(
-                    frames=sample["rgb"].frames[:, :1],
-                    frame_mask=torch.ones(1, 1, dtype=torch.bool),
-                    sample_ids=(sample["sample_id"],),
-                )
-                refined = _sam2_refine_trainable(
-                    provider, anchor_rgb, result.mask_logits[:, :, :1], device
-                )
-                refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
-                refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
-                refined_loss = (
-                    binary_mask_loss(refined, refined_target, refined_valid)
-                    + dice_loss(refined, refined_target, refined_valid)
-                ) * refined_weight
-                total_loss = total_loss + refined_loss
-            if (
-                swap_weight > 0
-                and record["control_kind"] == "positive"
-                and rng.random() < swap_prob
-            ):
-                partner_id = pair_map.get(record["sample_id"])
-                partner = records_by_id.get(partner_id) if partner_id else None
-                if partner is not None:
-                    swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
-                    swapped_result, _, _ = run_forward(swapped_sample, sample_task)
-                    valid_swap = batch.frame_mask[:, None, :]
-                    if batch.target_presence is not None:
-                        valid_swap = batch.target_presence & valid_swap
-                    swap_loss = query_swap_margin_loss(
-                        result.mask_logits,
-                        swapped_result.mask_logits,
-                        batch.target_masks,
-                        valid_swap,
-                        margin=float(training.get("swap_margin", 0.1)),
+        try:
+            with torch.autocast(device_type="cuda", dtype=torch.float16), seg_training_active(True):
+                result, losses, batch = run_forward(sample, sample_task)
+                total_loss = losses["total"]
+                if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
+                    anchor_rgb = RGBFrameBatch(
+                        frames=sample["rgb"].frames[:, :1],
+                        frame_mask=torch.ones(1, 1, dtype=torch.bool),
+                        sample_ids=(sample["sample_id"],),
                     )
-                    total_loss = total_loss + swap_loss * swap_weight
-                    swap_value = float(swap_loss.detach().item())
+                    refined = _sam2_refine_trainable(
+                        provider, anchor_rgb, result.mask_logits[:, :, :1], device
+                    )
+                    refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
+                    refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
+                    refined_loss = (
+                        binary_mask_loss(refined, refined_target, refined_valid)
+                        + dice_loss(refined, refined_target, refined_valid)
+                    ) * refined_weight
+                    total_loss = total_loss + refined_loss
+                if (
+                    swap_weight > 0
+                    and record["control_kind"] == "positive"
+                    and rng.random() < swap_prob
+                ):
+                    partner_id = pair_map.get(record["sample_id"])
+                    partner = records_by_id.get(partner_id) if partner_id else None
+                    if partner is not None:
+                        swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
+                        swapped_result, _, _ = run_forward(swapped_sample, sample_task)
+                        valid_swap = batch.frame_mask[:, None, :]
+                        if batch.target_presence is not None:
+                            valid_swap = batch.target_presence & valid_swap
+                        swap_loss = query_swap_margin_loss(
+                            result.mask_logits,
+                            swapped_result.mask_logits,
+                            batch.target_masks,
+                            valid_swap,
+                            margin=float(training.get("swap_margin", 0.1)),
+                        )
+                        total_loss = total_loss + swap_loss * swap_weight
+                        swap_value = float(swap_loss.detach().item())
+        except ValueError as error:
+            if "must contain only finite values" not in str(error):
+                raise
+            if logger is not None:
+                logger.message(
+                    f"step {step} SKIPPED non-finite sample {record['sample_id']} ({sample_task})"
+                )
+            step += 1
+            progress.update(1)
+            continue
         total_loss.backward()
         _sync_gradients(optimizer, world_size)
         grad_norm = float(
@@ -888,6 +933,28 @@ def _run(
                 )
                 history_entry.setdefault("eval", {})[eval_task] = round(val_iou, 4)
         step += 1
+        if rank == 0 and save_every > 0 and step % save_every == 0:
+            periodic = {
+                "step": step,
+                "decoder": decoder.state_dict(),
+                "projector": projector.state_dict(),
+                "seg_embedding": seg_injector.seg_embedding.detach().cpu(),
+                "lora": {
+                    name: [adapter.state_dict() for adapter in adapters]
+                    for name, adapters in lora_adapters.items()
+                },
+                "sam2_mask_decoder": (
+                    {
+                        name: parameter.detach().cpu().clone()
+                        for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters()
+                    }
+                    if sam2_mask_decoder_trainable
+                    else {}
+                ),
+                "optimizer": optimizer.state_dict(),
+            }
+            torch.save(periodic, output_dir / "checkpoint_latest.pt")
+            logger.message(f"step {step} checkpoint saved to checkpoint_latest.pt")
     progress.close()
 
     retention_checks: List[Dict[str, Any]] = []
@@ -980,6 +1047,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--manifest-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--resume", action="store_true", help="resume from checkpoint_latest.pt in --output")
     parser.add_argument("--retention-image-paths", nargs="+", default=None)
     parser.add_argument("--retention-video-dir", default=None)
     parser.add_argument("--video-manifest-dir", default=None)
@@ -1004,6 +1072,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         retention_image_paths=args.retention_image_paths,
         retention_video_dir=args.retention_video_dir,
         video_manifest_dir_text=args.video_manifest_dir,
+        resume=args.resume,
     )
     return 0
 
