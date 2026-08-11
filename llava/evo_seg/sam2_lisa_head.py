@@ -125,3 +125,102 @@ class Sam2LisaHead(nn.Module):
                 "prompt_dim": self.prompt_dim,
             },
         )
+
+    def forward_video_memory(
+        self,
+        seg_state: Tensor,
+        image_features: Tensor,
+        frame_mask: Tensor,
+        high_res_features: tuple = (),
+        memory_encoder: Any = None,
+        memory_attention: Any = None,
+        maskmem_tpos_enc: Any = None,
+        max_memory: int = 6,
+    ) -> SegmentationResult:
+        """Per-frame mask decoding conditioned on SAM2 memory (differentiable).
+
+        Runs the mask decoder over the video frames in temporal order; frames
+        after the first are decoded from memory-conditioned features produced by
+        the (optionally trainable) SAM2 memory encoder + memory attention.  This
+        teaches temporal consistency and propagation directly in the training
+        loop (GLUS/Sa2VA-style) instead of relying on post-hoc eval propagation.
+        """
+
+        batch_size, frames, channels, height, width = image_features.shape
+        prompt = self.seg_projection(self.seg_norm(seg_state))  # [B, prompt_dim]
+        object_logits = self.object_head(self.object_norm(seg_state))  # [B, 1]
+        dense = torch.zeros(
+            batch_size, 1, height, width, device=image_features.device, dtype=torch.float32
+        )
+        valid = frame_mask.to(device=image_features.device)
+        # per-frame spatial pos enc for the memory attention (reuse SAM2's learned pe)
+        curr_pos = self.image_pe.to(dtype=torch.float32).flatten(2).permute(0, 2, 1)  # [1, HW, C]
+        memory: list = []
+        per_frame_masks = []
+        for frame_index in range(frames):
+            if not bool(valid[:, frame_index].all()):
+                height_out, width_out = dense.shape[-2] * 4, dense.shape[-1] * 4
+                per_frame_masks.append(
+                    image_features.new_zeros(batch_size, 1, 1, height_out, width_out)
+                )
+                continue
+            pix_feat = image_features[:, frame_index].to(dtype=torch.float32)  # [B, C, H, W]
+            if memory and memory_attention is not None:
+                # memories: M x {"vision_features": [B,C,H,W], "vision_pos_enc": [[B,C,H,W]]}
+                mem_feats = torch.stack([m["vision_features"] for m in memory])  # [M,B,C,H,W]
+                mem_feats = mem_feats.permute(1, 0, 2, 3, 4).reshape(batch_size, len(memory), channels, -1)
+                mem_feats = mem_feats.permute(0, 3, 1, 2).reshape(batch_size, -1, channels)  # [B, M*HW, C]
+                mem_pos = torch.stack([m["vision_pos_enc"][-1] for m in memory])  # [M,B,C,H,W]
+                mem_pos = mem_pos.permute(1, 0, 2, 3, 4).reshape(batch_size, len(memory), channels, -1)
+                mem_pos = mem_pos.permute(0, 3, 1, 2).reshape(batch_size, -1, channels)
+                if maskmem_tpos_enc is not None:
+                    tpos = maskmem_tpos_enc.to(dtype=torch.float32)  # [num_maskmem, C]
+                    offsets = torch.arange(len(memory), device=mem_pos.device)
+                    tpos_sel = tpos[offsets]  # [M, C]
+                    hw = height * width
+                    tpos_b = tpos_sel.view(1, len(memory), 1, -1).repeat(batch_size, 1, hw, 1)
+                    mem_pos = mem_pos + tpos_b.view(batch_size, -1, tpos_sel.shape[-1])
+                curr = pix_feat.flatten(2).permute(0, 2, 1)  # [B, HW, C]
+                fused = memory_attention(
+                    curr=curr,
+                    memory=mem_feats,
+                    curr_pos=curr_pos.expand(batch_size, -1, -1),
+                    memory_pos=mem_pos,
+                    num_obj_ptr_tokens=0,
+                )
+                pix_feat = fused.permute(0, 2, 1).view(batch_size, channels, height, width)
+            frame_masks, _, _, _ = self.sam_mask_decoder(
+                image_embeddings=pix_feat,
+                image_pe=self.image_pe.to(dtype=torch.float32),
+                sparse_prompt_embeddings=prompt.unsqueeze(1),
+                dense_prompt_embeddings=dense,
+                multimask_output=False,
+                repeat_image=False,
+                high_res_features=(
+                    [level[:, frame_index].to(dtype=torch.float32) for level in high_res_features]
+                    if high_res_features
+                    else None
+                ),
+            )
+            per_frame_masks.append(frame_masks.unsqueeze(2))  # [B, 1, 1, H', W']
+            if memory_encoder is not None:
+                mem_out = memory_encoder(pix_feat, frame_masks.float().sigmoid())
+                memory.append(mem_out)
+                if max_memory > 0 and len(memory) > max_memory:
+                    memory = memory[-max_memory:]
+        mask_logits = torch.cat(per_frame_masks, dim=2)
+        mask_logits = mask_logits * valid[:, None, :, None, None].to(dtype=mask_logits.dtype)
+        frame_embeddings = seg_state.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, frames, -1)
+        return SegmentationResult(
+            mask_logits=mask_logits,
+            object_logits=object_logits,
+            object_embeddings=seg_state.unsqueeze(1),
+            frame_embeddings=frame_embeddings,
+            frame_mask=frame_mask.to(device=seg_state.device),
+            diagnostics={
+                "head": "sam2_lisa_memory",
+                "mask_output_size": tuple(mask_logits.shape),
+                "prompt_dim": self.prompt_dim,
+                "memory_frames": len(memory),
+            },
+        )

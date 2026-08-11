@@ -665,6 +665,17 @@ def _run(
         # step; only the standalone (query-decoder) head needs its own group.
         if str(config.get("head", "query_decoder")) != "lisa":
             sam2_mask_decoder_params.extend(mask_decoder.parameters())
+    sam2_memory_trainable = bool(training.get("sam2_memory_trainable", False))
+    if sam2_memory_trainable:
+        sam2_model = provider._predictor.model
+        for module_name in ("memory_encoder", "memory_attention"):
+            module = getattr(sam2_model, module_name, None)
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
+                    sam2_mask_decoder_params.append(parameter)
+        print("[train] SAM2 memory encoder+attention trainable", flush=True)
+    video_memory = bool(training.get("video_memory", False))
 
     capability = SegmentationCapability(decoder)
     adapter = VILASegmentationAdapter(model, provider, capability)
@@ -703,6 +714,16 @@ def _run(
                 for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters():
                     if name in state["sam2_mask_decoder"]:
                         parameter.copy_(state["sam2_mask_decoder"][name].to(device))
+        if sam2_memory_trainable and state.get("sam2_memory"):
+            with torch.no_grad():
+                for module_name in ("memory_encoder", "memory_attention"):
+                    module = getattr(provider._predictor.model, module_name, None)
+                    if module is None:
+                        continue
+                    for name, parameter in module.named_parameters():
+                        key = f"{module_name}.{name}"
+                        if key in state["sam2_memory"]:
+                            parameter.copy_(state["sam2_memory"][key].to(device))
         if state.get("optimizer"):
             optimizer.load_state_dict(state["optimizer"])
         start_step = int(state.get("step", 0))
@@ -853,12 +874,24 @@ def _run(
             seg_state = query_states_raw[
                 torch.arange(query_states_raw.shape[0], device=device), seg_positions
             ]
-            result = decoder(
-                seg_state,
-                dense.features,
-                dense.frame_mask,
-                dense.high_res_features,
-            )
+            if video_memory and sample_task == "video":
+                sam2_model = provider._predictor.model
+                result = decoder.forward_video_memory(
+                    seg_state,
+                    dense.features,
+                    dense.frame_mask,
+                    dense.high_res_features,
+                    memory_encoder=sam2_model.memory_encoder if sam2_memory_trainable else None,
+                    memory_attention=sam2_model.memory_attention if sam2_memory_trainable else None,
+                    maskmem_tpos_enc=getattr(sam2_model, "maskmem_tpos_enc", None),
+                )
+            else:
+                result = decoder(
+                    seg_state,
+                    dense.features,
+                    dense.frame_mask,
+                    dense.high_res_features,
+                )
             batch = GroundingBatch(
                 query_states=seg_state.unsqueeze(1),
                 query_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
@@ -1233,6 +1266,15 @@ def _run(
                         for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters()
                     }
                     if sam2_mask_decoder_trainable
+                    else {}
+                ),
+                "sam2_memory": (
+                    {
+                        f"{module_name}.{name}": parameter.detach().cpu().clone()
+                        for module_name in ("memory_encoder", "memory_attention")
+                        for name, parameter in getattr(provider._predictor.model, module_name).named_parameters()
+                    }
+                    if sam2_memory_trainable
                     else {}
                 ),
                 "optimizer": optimizer.state_dict(),

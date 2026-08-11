@@ -31,6 +31,10 @@ training:
   swap_margin: 0.1
   epoch_cycle: true
   grad_accum: 2
+  # 视频 memory 训练 (第5项): 逐帧时序解码 + SAM2 memory attention 端到端。
+  # 需 GPU smoke 验证后再开; 开启时解冻 memory_encoder + memory_attention (约7.3M 参数)。
+  sam2_memory_trainable: false
+  video_memory: false
 
 lora:
   rank: 64
