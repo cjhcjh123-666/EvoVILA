@@ -58,11 +58,27 @@ def main(argv=None) -> int:
 
     figure, axes = plt.subplots(2, 2, figsize=(14, 9))
 
+    def rolling(values, window=50):
+        cleaned = [0.0 if v is None else float(v) for v in values]
+        out = []
+        for index in range(len(cleaned)):
+            lo = max(0, index - window + 1)
+            out.append(sum(cleaned[lo : index + 1]) / (index - lo + 1))
+        return out
+
     def plot(ax, values, title, color="tab:blue"):
         points = [(s, v) for s, v in zip(steps, values) if v is not None]
         if points:
-            ax.plot([p[0] for p in points], [p[1] for p in points], color=color)
-        ax.set_title(title)
+            raw_steps = [p[0] for p in points]
+            raw_values = [p[1] for p in points]
+            ax.plot(raw_steps, raw_values, color=color, alpha=0.25, linewidth=0.7)
+            if len(raw_values) >= 5:
+                ax.plot(raw_steps, rolling(raw_values), color=color, linewidth=1.8)
+                ax.set_title(f"{title} (raw + 50-step avg)")
+            else:
+                ax.set_title(title)
+        else:
+            ax.set_title(title)
         ax.set_xlabel("step")
         ax.grid(alpha=0.3)
 

@@ -484,6 +484,7 @@ def _run(
     video_manifest_dir_text: Optional[str] = None,
     no_object_image_manifest: Optional[Path] = None,
     resume: bool = False,
+    wandb_project: Optional[str] = None,
 ) -> Dict[str, Any]:
     device, rank, world_size = _setup_distributed(device_text)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -809,6 +810,7 @@ def _run(
 
     logger = TrainingLogger(output_dir) if rank == 0 else None
     tb_writer = None
+    run_wandb = None
     if rank == 0:
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -816,6 +818,24 @@ def _run(
             tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
         except Exception:  # tensorboard is an optional dependency
             tb_writer = None
+        if wandb_project:
+            try:
+                import wandb
+
+                run_wandb = wandb.init(
+                    project=wandb_project,
+                    config={
+                        "output": str(output_dir),
+                        "head": str(config.get("head", "query_decoder")),
+                        "steps": steps,
+                        "config_path": str(config_path),
+                    },
+                    reinit=True,
+                    settings=wandb.Settings(start_method="fork"),
+                )
+            except Exception as error:
+                print(f"[train] wandb init failed (continuing without wandb): {error}", flush=True)
+                run_wandb = None
     history: List[Dict[str, Any]] = []
     history_file = output_dir / "train_history.jsonl"
     if rank == 0:
@@ -1012,6 +1032,22 @@ def _run(
                     tb_writer.add_scalar("train/swap", history_entry["swap"], step)
                     tb_writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], step)
                     tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+                if run_wandb is not None:
+                    run_wandb.log(
+                        {
+                            "train/loss": history_entry["loss"],
+                            "train/iou": anchor_iou,
+                            "train/bce": history_entry["bce"],
+                            "train/dice": history_entry["dice"],
+                            "train/objectness": history_entry["objectness"],
+                            "train/temporal": history_entry["temporal"],
+                            "train/swap": history_entry["swap"],
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/grad_norm": grad_norm,
+                            "step": step,
+                        },
+                        step=step,
+                    )
         if rank == 0 and (step % eval_every == 0 or step == steps - 1):
             for eval_task, eval_dir, eval_loader in (
                 ("image", image_manifest_dir, image_loader),
@@ -1049,6 +1085,8 @@ def _run(
                 history_entry.setdefault("eval", {})[eval_task] = round(val_iou, 4)
                 if tb_writer is not None:
                     tb_writer.add_scalar(f"eval/val_iou_{eval_task}", val_iou, step)
+                if run_wandb is not None:
+                    run_wandb.log({f"eval/val_iou_{eval_task}": val_iou, "step": step}, step=step)
         step += 1
         if rank == 0 and save_every > 0 and step % save_every == 0:
             periodic = {
@@ -1143,6 +1181,8 @@ def _run(
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         if tb_writer is not None:
             tb_writer.close()
+        if run_wandb is not None:
+            run_wandb.finish()
         return summary
     return {}
 
@@ -1176,6 +1216,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="enable torch.autograd.set_detect_anomaly to trace the first non-finite gradient",
     )
+    parser.add_argument("--wandb-project", default=None, help="optional wandb project name for live curves")
     args = parser.parse_args(argv)
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
@@ -1205,6 +1246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else None
         ),
         resume=args.resume,
+        wandb_project=args.wandb_project,
     )
     return 0
 
