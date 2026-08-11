@@ -115,7 +115,7 @@ def _eval_image_record(
     spatial_scale: int,
 ) -> Dict[str, Any]:
     sample = _image_sample(record, model, tokenizer, template, seg_id, device)
-    with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         query_states = adapter.extract_query_states_training(
             sample["input_ids"], sample["media"], sample["media_config"],
             sample["query_mask"], sample["attention_mask"], hidden_layer=hidden_layer,
@@ -163,7 +163,7 @@ def _eval_video_record(
     hidden_layer: int,
 ) -> Dict[str, Any]:
     sample = _video_sample(record, model, tokenizer, template, seg_id, device)
-    with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         query_states = adapter.extract_query_states_training(
             sample["input_ids"], sample["media"], sample["media_config"],
             sample["query_mask"], sample["attention_mask"], hidden_layer=hidden_layer,
@@ -349,6 +349,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model = llava.load(str(args.vila_model), device=str(device), device_map={"": str(device)})
     model.eval()
     model.requires_grad_(False)
+    # Keep VILA in its native bf16 precision (QuantLinearTE casts to bf16);
+    # the fp16 residual stream can overflow to Inf and corrupt predictions.
+    model.to(torch.bfloat16)
     tokenizer = model.tokenizer
     seg_id = tokenizer.convert_tokens_to_ids("[SEG]")
     if seg_id == tokenizer.unk_token_id:

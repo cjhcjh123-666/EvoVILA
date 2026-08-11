@@ -179,7 +179,7 @@ def _prepare_inputs(model: Any, conversation: List[Dict[str, Any]]):
     device = next(model.parameters()).device
     if media["image"]:
         processed = process_images(media["image"], model.vision_tower.image_processor, model.config)
-        processed = processed.to(device=device, dtype=torch.float16)
+        processed = processed.to(device=device, dtype=torch.bfloat16)
         media["image"] = [item for item in processed]
     else:
         media = {}
@@ -506,6 +506,12 @@ def _run(
     print(f"[train] model loaded in {vila_initialization_ms:.0f} ms", flush=True)
     model.eval()
     model.requires_grad_(False)
+    # VILA is natively a mixed bf16/FP8 model (QuantLinearTE casts to bf16).
+    # Running the fp16 residual stream under fp16 autocast overflows to Inf for
+    # some samples (fp16 max ~65504), and the final RMSNorm turns Inf into NaN
+    # (Inf * 0).  Convert the whole frozen backbone to bf16 so the training
+    # forward is numerically stable; the fp32 segmentation stack is unaffected.
+    model.to(torch.bfloat16)
 
     tokenizer = model.tokenizer
     seg_id = tokenizer.convert_tokens_to_ids("[SEG]")
@@ -733,9 +739,9 @@ def _run(
     seg_loss_weights.pop("query_swap", None)
 
     def run_forward(sample: Dict[str, Any], sample_task: str, with_loss: bool = True):
-        # VILA forward stays fp16 (frozen and heavy); the segmentation stack
-        # (projector/decoder/losses) runs in fp32 to avoid fp16 overflow.
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
+        # VILA forward runs in bf16 (native model precision); the segmentation
+        # stack (projector/decoder/losses) runs in fp32 to avoid overflow.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             query_states = adapter.extract_query_states_training(
                 sample["input_ids"],
                 sample["media"],
@@ -874,8 +880,9 @@ def _run(
             continue
         total_loss.backward()
         _sync_gradients(optimizer, world_size)
+        param_names = {id(parameter): name for name, parameter in model.named_parameters()}
         nan_grads = [
-            f"{group['name']}:{parameter.grad.abs().max().item():.3e}"
+            f"{param_names.get(id(parameter), group['name'])}:{parameter.grad.abs().max().item():.3e}"
             for group in optimizer.param_groups
             for parameter in group["params"]
             if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
@@ -1109,7 +1116,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--retention-video-dir", default=None)
     parser.add_argument("--video-manifest-dir", default=None)
     parser.add_argument("--no-object-image-manifest", default=None, help="extra no_object image records (jsonl)")
+    parser.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        help="enable torch.autograd.set_detect_anomaly to trace the first non-finite gradient",
+    )
     args = parser.parse_args(argv)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
     config_path = args.config.expanduser().resolve()
     output_dir = args.output.expanduser().resolve()
     try:

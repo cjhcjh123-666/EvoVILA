@@ -37,6 +37,10 @@ def _align_targets(logits: Tensor, targets: Tensor) -> Tensor:
 
 def _masked_mean(values: Tensor, valid: Tensor) -> Tensor:
     weights = valid.to(dtype=values.dtype)
+    # Zero out invalid entries before weighting: NaN * 0 == NaN in floating
+    # point, so a non-finite value at a masked position would otherwise poison
+    # the whole mean (and its gradient).
+    values = torch.where(valid, values, torch.zeros_like(values))
     return (values * weights).sum() / weights.sum().clamp_min(1)
 
 
