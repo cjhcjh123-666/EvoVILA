@@ -1,45 +1,88 @@
-# EvoVILA User Requirements
+# EvoVILA-Seg User Requirements
 
-## Repository and environment
+## Repository And Environment
 
-- Work in `/9950backfile/chenjiahui/EvoVILA`; do not use
-  `/media/insslab/F0521D36521D0350` as the repository working directory.
-- Keep the active environment under `/9950backfile`, at
+- Work from branch `EvoVILA-Seg`, based exactly on VILA `main` commit
+  `0f1426e8da9181e6e6653e10bc15f62d515fa2f6`.
+- Use the existing PyTorch VILA codebase and the environment at
   `/9950backfile/chenjiahui/.conda/envs/evovila`.
-- Preserve the existing `long_rl` user modification. It must not be included
-  in EvoVILA commits.
-- Keep model weights, datasets, caches, generated masks, and experiment
+- Preserve the original `long_rl` submodule relationship. Do not include the
+  user's local `long_rl` modification in EvoVILA-Seg commits.
+- Keep model weights, datasets, caches, generated masks, logs, and experiment
   results outside Git.
+- Do not download weights or datasets as part of code-only milestones.
 
-## M3 scope
+## Confirmed Objective
 
-- Implement the next milestone, M3, as an explicit `video_segmentation`
-  capability based on the local SAM2 source and SAM2.1 checkpoint.
-- Preserve ordinary VILA image, multi-image, video, captioning, QA, and
-  reasoning paths. They must not import, initialize, or execute SAM2.
-- Keep SAM2 import and predictor construction lazy. An explicit capability
-  configuration is required before the video branch can run.
-- Support a directory of JPEG frames and an MP4 input accepted by SAM2.
-- Support anchor-frame point and box prompts, including multiple object
-  prompts.
-- Return masks shaped `[T, H, W]` for one object or `[T, N, H, W]` for multiple
-  objects, with stable object-ID metadata.
-- Record anchor, propagation, and total latency for every video segmentation
-  request.
-- Add a DAVIS validation-sequence GPU smoke test using existing external
-  assets. Do not download or copy assets into the repository.
+Extend VILA with language-conditioned image and video spatiotemporal
+segmentation while preserving its existing text, single-image, multi-image,
+video, QA, captioning, and multimodal reasoning behavior.
 
-## Explicitly deferred
+The confirmed architecture assigns responsibilities as follows:
 
-- `[SEG]` tokens, text-conditioned referring segmentation, reasoning
-  segmentation, dynamic anchor selection, capability routing, mixed training,
-  retention/distillation, and full benchmark training.
+- VILA provides semantic understanding of the user query and media context.
+- A trainable query-conditioned spatial decoder aligns language tokens with
+  dense visual features and predicts an anchor mask, object confidence, and
+  object representation.
+- SAM2 refines image masks and propagates predicted anchor masks through
+  video. SAM2 does not replace VILA's language or ordinary media path.
+- An image is handled by the same segmentation contract as a one-frame video
+  (`T=1`).
 
-## Verification
+## Capability Preservation Invariants
 
-- Run focused unit tests without requiring SAM2 or external model assets.
-- Run `py_compile`, `pip check`, and the existing VILA regression/smoke checks
-  in `evovila`.
-- Run the end-to-end GPU smoke with:
-  `/9950backfile/zhangyafei/sam2` on `PYTHONPATH`, the existing SAM2.1 tiny
-  checkpoint, and one DAVIS 2017 validation sequence.
+- Segmentation is opt-in at request time. The default request executes the
+  original VILA path.
+- A normal VILA request must not import, initialize, or execute SAM2 or any
+  dense decoder.
+- The first training stages freeze all original VILA and SAM2 parameters.
+- If capability-specific LoRA is later required, it must be disabled for
+  normal requests and the base VILA weights must remain immutable.
+- `[SEG]` may mark a mask-producing response, but a single `[SEG]` hidden state
+  must not be the sole grounding representation.
+- Do not use a direct LLM-hidden-to-SAM2-sparse-prompt projector as the main
+  route. Predict an anchor mask from explicit language-spatial interaction and
+  pass that mask to SAM2.
+- Image and video segmentation must remain separately measurable even though
+  they share contracts and decoder components.
+
+## Implementation Strategy
+
+- Use wrappers, adapters, registries, and narrow observation hooks around VILA.
+- Build and validate the independent segmentation contracts and decoder before
+  editing VILA core files.
+- Use multi-token query states and cross-attention over dense spatial features.
+- Include same-image different-target, query-swap, empty-query, and no-object
+  controls in training and validation contracts.
+- Treat dynamic anchor selection, conditional compute, and shared-parameter
+  VILA fine-tuning as later milestones, not first-stage requirements.
+- S1 query extraction must use an explicit original-token query mask and fused
+  provenance. It must not infer the referring expression from a single marker
+  token or keep model-global media/query state.
+- S1 runs VILA under frozen teacher forcing with local sequence packing
+  disabled so hidden states stay aligned with the observed fused sequence.
+
+## Execution Policy
+
+- Automatically run CPU/no-weight unit tests, static compilation, and Git
+  hygiene checks.
+- Do not start long GPU training or dataset downloads without a separate
+  confirmed experiment plan.
+- Keep the project README at the repository root and extension documentation
+  under `docs/`.
+
+## Coding Phase E Assumptions
+
+The user confirmed starting implementation on 2026-08-05. The following
+working assumptions apply to the S0 no-weight milestone and can be superseded
+by a later user constraint:
+
+- Reuse `/9950backfile/chenjiahui/.conda/envs/evovila`.
+- Run S0 checks on CPU with synthetic tensors; do not start long GPU training.
+- Do not download datasets, model weights, or SAM2 assets in this milestone.
+- Automatically run fast unit tests, smoke tests, `py_compile`, and
+  `git diff --check`; defer full training and benchmark runs.
+- Preserve the existing `origin`/`upstream` remotes and Git identity; do not
+  push during this implementation turn.
+- Keep the existing VILA README at the repository root; extension notes remain
+  under `docs/`.

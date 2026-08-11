@@ -41,6 +41,7 @@ from llava.model.language_model.builder import build_llm_and_tokenizer
 from llava.model.multimodal_encoder.builder import build_vision_tower
 from llava.model.multimodal_projector.builder import build_mm_projector
 from llava.model.utils import get_model_config
+from llava.model.fusion_observer import current_fusion_observer
 from llava.train.sequence_parallel import get_pg_manager
 from llava.utils import distributed
 from llava.utils.media import extract_media
@@ -561,7 +562,7 @@ class LlavaMetaForCausalLM(ABC):
         attention_mask: Optional[torch.Tensor],
         capability_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self._notify_capabilities(input_ids, media, media_config, metadata=capability_inputs)
+        fusion_observer = current_fusion_observer()
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
         attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
 
@@ -591,6 +592,12 @@ class LlavaMetaForCausalLM(ABC):
 
         # Remove padding
         batch_size = labels.shape[0]
+        if fusion_observer is not None:
+            valid_input_ids = [input_ids[k][attention_mask[k]] for k in range(batch_size)]
+            valid_input_positions = [
+                torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)[attention_mask[k]]
+                for k in range(batch_size)
+            ]
         text_embeds = [text_embeds[k][attention_mask[k]] for k in range(batch_size)]
         labels = [labels[k][attention_mask[k]] for k in range(batch_size)]
 
@@ -601,26 +608,44 @@ class LlavaMetaForCausalLM(ABC):
 
         # Fuse text and media embeddings
         inputs_m, labels_m = [], []
+        fusion_rows = []
         for k in range(batch_size):
             inputs_mk, labels_mk = [], []
+            source_types, source_positions = [], []
             pos = 0
             while pos < len(labels[k]):
-                if input_ids[k][pos].item() in media_tokens:
+                token_id = valid_input_ids[k][pos].item() if fusion_observer is not None else input_ids[k][pos].item()
+                if token_id in media_tokens:
                     end = pos + 1
-                    name = media_tokens[input_ids[k][pos].item()] if PROCESS_GROUP_MANAGER is None else "video"
+                    name = media_tokens[token_id] if PROCESS_GROUP_MANAGER is None else "video"
                     input = media_embeds[name].popleft()
                     label = torch.full([input.shape[0]], IGNORE_INDEX, device=labels[k].device, dtype=labels[k].dtype)
+                    if fusion_observer is not None:
+                        source_types.extend([name] * input.shape[0])
+                        source_positions.extend([-1] * input.shape[0])
                 else:
                     end = pos
-                    while end < len(labels[k]) and input_ids[k][end].item() not in media_tokens:
+                    while end < len(labels[k]):
+                        end_token_id = (
+                            valid_input_ids[k][end].item()
+                            if fusion_observer is not None
+                            else input_ids[k][end].item()
+                        )
+                        if end_token_id in media_tokens:
+                            break
                         end += 1
                     input = text_embeds[k][pos:end]
                     label = labels[k][pos:end]
+                    if fusion_observer is not None:
+                        source_types.extend(["text"] * (end - pos))
+                        source_positions.extend(valid_input_positions[k][pos:end].tolist())
                 inputs_mk.append(input)
                 labels_mk.append(label)
                 pos = end
             inputs_m.append(torch.cat(inputs_mk, dim=0))
             labels_m.append(torch.cat(labels_mk, dim=0))
+            if fusion_observer is not None:
+                fusion_rows.append({"source_type": source_types, "source_position": source_positions})
         inputs, labels = inputs_m, labels_m
 
         # Check if all media embeddings are consumed
@@ -632,7 +657,17 @@ class LlavaMetaForCausalLM(ABC):
         inputs, labels = self.__truncate_sequence(inputs, labels)
 
         # Pad sequences to the longest one in the batch
-        return self.__batchify_sequence(inputs, labels)
+        batchified = self.__batchify_sequence(inputs, labels)
+        if fusion_observer is not None:
+            for row, input_value in zip(fusion_rows, inputs):
+                row["source_type"] = row["source_type"][: input_value.shape[0]]
+                row["source_position"] = row["source_position"][: input_value.shape[0]]
+            fusion_observer.observe_fusion(
+                fusion_rows,
+                padding_side=self.tokenizer.padding_side,
+                fused_attention_mask=batchified[2],
+            )
+        return batchified
 
     def __embed_media_tokens(
         self,
@@ -1485,7 +1520,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         original_image_sizes=None,
         capability_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self._notify_capabilities(input_ids, media, media_config, metadata=capability_inputs)
+        fusion_observer = current_fusion_observer()
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
         attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
 
@@ -1523,6 +1558,12 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
 
         # Remove padding
         batch_size = labels.shape[0]
+        if fusion_observer is not None:
+            valid_input_ids = [input_ids[k][attention_mask[k]] for k in range(batch_size)]
+            valid_input_positions = [
+                torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)[attention_mask[k]]
+                for k in range(batch_size)
+            ]
         text_embeds = [text_embeds[k][attention_mask[k]] for k in range(batch_size)]
         labels = [labels[k][attention_mask[k]] for k in range(batch_size)]
 
@@ -1533,26 +1574,44 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
 
         # Fuse text and media embeddings
         inputs_m, labels_m = [], []
+        fusion_rows = []
         for k in range(batch_size):
             inputs_mk, labels_mk = [], []
+            source_types, source_positions = [], []
             pos = 0
             while pos < len(labels[k]):
-                if input_ids[k][pos].item() in media_tokens:
+                token_id = valid_input_ids[k][pos].item() if fusion_observer is not None else input_ids[k][pos].item()
+                if token_id in media_tokens:
                     end = pos + 1
-                    name = media_tokens[input_ids[k][pos].item()]
+                    name = media_tokens[token_id]
                     input = media_embeds[name].popleft()
                     label = torch.full([input.shape[0]], IGNORE_INDEX, device=labels[k].device, dtype=labels[k].dtype)
+                    if fusion_observer is not None:
+                        source_types.extend([name] * input.shape[0])
+                        source_positions.extend([-1] * input.shape[0])
                 else:
                     end = pos
-                    while end < len(labels[k]) and input_ids[k][end].item() not in media_tokens:
+                    while end < len(labels[k]):
+                        end_token_id = (
+                            valid_input_ids[k][end].item()
+                            if fusion_observer is not None
+                            else input_ids[k][end].item()
+                        )
+                        if end_token_id in media_tokens:
+                            break
                         end += 1
                     input = text_embeds[k][pos:end]
                     label = labels[k][pos:end]
+                    if fusion_observer is not None:
+                        source_types.extend(["text"] * (end - pos))
+                        source_positions.extend(valid_input_positions[k][pos:end].tolist())
                 inputs_mk.append(input)
                 labels_mk.append(label)
                 pos = end
             inputs_m.append(torch.cat(inputs_mk, dim=0))
             labels_m.append(torch.cat(labels_mk, dim=0))
+            if fusion_observer is not None:
+                fusion_rows.append({"source_type": source_types, "source_position": source_positions})
         inputs, labels = inputs_m, labels_m
 
         # Check if all media embeddings are consumed
@@ -1564,8 +1623,18 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         inputs, labels = self._LlavaMetaForCausalLM__truncate_sequence(inputs, labels)
 
         # Pad sequences to the longest one in the batch
+        batchified = self._LlavaMetaForCausalLM__batchify_sequence(inputs, labels)
+        if fusion_observer is not None:
+            for row, input_value in zip(fusion_rows, inputs):
+                row["source_type"] = row["source_type"][: input_value.shape[0]]
+                row["source_position"] = row["source_position"][: input_value.shape[0]]
+            fusion_observer.observe_fusion(
+                fusion_rows,
+                padding_side=self.tokenizer.padding_side,
+                fused_attention_mask=batchified[2],
+            )
         return (
-            *self._LlavaMetaForCausalLM__batchify_sequence(inputs, labels),
+            *batchified,
             top_down_selection_maps,
             top_down_selection_probs,
         )

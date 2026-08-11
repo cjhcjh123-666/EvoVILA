@@ -1,38 +1,20 @@
-# Local environments and editor state
-.venv/
-venv/
-env/
 __pycache__/
 *.py[cod]
-*.egg-info/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.idea/
-.vscode/
 
-# Model weights, checkpoints, datasets, and generated outputs
+# Local environments and credentials
+.env
+.venv/
+
+# External data, checkpoints, and generated artifacts
+/data/
+/logs/
+/results/
+/runs/
+*.bin
 *.ckpt
 *.pt
 *.pth
-*.bin
-*.safetensors
-*.onnx
-checkpoints/
-outputs/
-runs/
-wandb/
-datasets/
-data/cache/
-generated_masks/
-masks/
-videos/
-experiment_outputs/
-results/
 
-# Local caches and private configuration
-.cache/
-*.log
-.env
-.env.*
-!.env.example
+# Local experiment runners (wandb sync logs)
+/wandb/

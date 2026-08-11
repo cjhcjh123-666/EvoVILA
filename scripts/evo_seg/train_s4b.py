@@ -1,0 +1,1386 @@
+"""S4b T1 image overfit: train decoder + [SEG] + projector + LoRA (+SAM2 mask decoder).
+
+Outputs (checkpoints, retention baselines, summaries) are written only outside
+the repository.  Ordinary VILA requests remain unchanged because LoRA/[SEG]
+contribute only inside the explicit training scope.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+if str(_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_ROOT_FOR_IMPORT))
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+import yaml
+from PIL import Image
+from tqdm import tqdm
+
+from llava.evo_seg.capability import SegmentationCapability
+from llava.evo_seg.contracts import GroundingBatch
+from llava.evo_seg.decoder import QueryConditionedSpatialDecoder
+from llava.evo_seg.losses import (
+    binary_mask_loss,
+    compute_segmentation_loss,
+    dice_loss,
+    objectness_loss,
+    query_swap_margin_loss,
+)
+from llava.evo_seg.sam2_adapter import DenseFeatureBatch, RGBFrameBatch, SAM2ImageFeatureProvider
+from llava.evo_seg.sam2_lisa_head import Sam2LisaHead
+from llava.evo_seg.training import (
+    GroundingProjector,
+    SegEmbeddingInjector,
+    SegTrainingPolicy,
+    apply_lora,
+    seg_training_active,
+)
+from llava.evo_seg.vila_adapter import VILASegmentationAdapter
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _git_commit(root: Path) -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _load_config(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    if not isinstance(config, dict):
+        raise ValueError("config must contain a mapping")
+    return config
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _timed_call(device: torch.device, function):
+    _synchronize(device)
+    started = time.perf_counter()
+    value = function()
+    _synchronize(device)
+    return value, (time.perf_counter() - started) * 1000.0
+
+
+def _upsample_dense(dense: DenseFeatureBatch, scale: int) -> DenseFeatureBatch:
+    """Optionally raise the decoder spatial resolution (SAM2 stride 16 -> finer)."""
+
+    if scale <= 1:
+        return dense
+    batch_size, frames, channels, height, width = dense.features.shape
+    features = F.interpolate(
+        dense.features.reshape(batch_size * frames, channels, height, width),
+        scale_factor=float(scale),
+        mode="bilinear",
+        align_corners=False,
+    ).reshape(batch_size, frames, channels, height * scale, width * scale)
+    return DenseFeatureBatch(
+        features=features,
+        frame_mask=dense.frame_mask,
+        diagnostics=dense.diagnostics,
+    )
+
+
+class _CyclicPool:
+    """Epoch-cycling sampler: shuffle once, walk the full pool, reshuffle.
+
+    Guarantees every training record is seen exactly once per epoch (full data
+    coverage), instead of the legacy random-with-replacement draw that only
+    ever touches a fraction of the manifest in a fixed step budget.
+    """
+
+    def __init__(self, records, rng) -> None:
+        self.records = [record for record in records]
+        self.rng = rng
+        self._index = 0
+        self._shuffle()
+
+    @property
+    def size(self) -> int:
+        return len(self.records)
+
+    def _shuffle(self) -> None:
+        self.rng.shuffle(self.records)
+
+    def next(self):
+        if self._index >= len(self.records):
+            self._shuffle()
+            self._index = 0
+        record = self.records[self._index]
+        self._index += 1
+        return record
+
+
+def _setup_distributed(device_text: str) -> Tuple[torch.device, int, int]:
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if local_rank >= 0:
+        dist.init_process_group(backend="nccl")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        return device, rank, world_size
+    device = torch.device(device_text)
+    return device, 0, 1
+
+
+def _timestamp() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class TrainingLogger:
+    """Structured, flushed training log written to stdout and a file."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.path = output_dir / "train.log"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a", encoding="utf-8")
+
+    def step(self, **fields: Any) -> None:
+        line = " ".join(f"{key}={value}" for key, value in fields.items())
+        full = f"[{_timestamp()}] {line}"
+        print(full, flush=True)
+        self._handle.write(full + "\n")
+        self._handle.flush()
+
+    def message(self, text: str) -> None:
+        full = f"[{_timestamp()}] {text}"
+        print(full, flush=True)
+        self._handle.write(full + "\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+def _sync_gradients(optimizer: torch.optim.Optimizer, world_size: int) -> None:
+    if world_size <= 1:
+        return
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.grad is None:
+                continue
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(world_size)
+
+
+def _token_ids(tokenizer: Any, text: str) -> tuple[int, ...]:
+    encoded = tokenizer(text, add_special_tokens=False)
+    values = getattr(encoded, "input_ids", encoded)
+    if isinstance(values, torch.Tensor):
+        values = values.flatten().tolist()
+    if values and isinstance(values[0], (list, tuple)):
+        values = values[0]
+    return tuple(int(value) for value in values)
+
+
+def _prepare_inputs(model: Any, conversation: List[Dict[str, Any]]):
+    from llava.mm_utils import process_images
+    from llava.utils.media import extract_media
+    from llava.utils.tokenizer import tokenize_conversation
+
+    media = extract_media(conversation, config=model.config)
+    device = next(model.parameters()).device
+    if media["image"]:
+        processed = process_images(media["image"], model.vision_tower.image_processor, model.config)
+        processed = processed.to(device=device, dtype=torch.bfloat16)
+        media["image"] = [item for item in processed]
+    else:
+        media = {}
+    input_ids = tokenize_conversation(
+        conversation, model.tokenizer, add_generation_prompt=True
+    ).unsqueeze(0).to(device=device)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    media_config = defaultdict(dict) if media else {}
+    return input_ids, media, media_config, attention_mask
+
+
+def _query_span_mask(
+    input_ids: torch.Tensor, tokenizer: Any, query: str, seg_id: int
+) -> Tuple[torch.Tensor, int]:
+    if input_ids.shape[0] != 1:
+        raise ValueError("query span helper requires batch size one")
+    row = input_ids[0].tolist()
+    spans = set()
+    for candidate_text in (query, f" {query}"):
+        candidate = _token_ids(tokenizer, candidate_text)
+        if not candidate:
+            continue
+        for start in range(len(row) - len(candidate) + 1):
+            if tuple(row[start : start + len(candidate)]) == candidate:
+                spans.add((start, start + len(candidate)))
+    if len(spans) != 1:
+        # Robust fallback: locate the [SEG] token and the template colon that
+        # separates the instruction prefix from the referring expression.
+        seg_positions = [index for index, token in enumerate(row) if token == seg_id]
+        if not seg_positions:
+            raise ValueError("[SEG] token missing from the prompt")
+        seg_position = seg_positions[-1]
+        newline_id = _token_ids(tokenizer, "\n")[0]
+        newline_positions = [index for index in range(seg_position) if row[index] == newline_id]
+        colon_id = _token_ids(tokenizer, ":")[0]
+        colon_positions = [index for index in range(seg_position) if row[index] == colon_id]
+        if newline_positions:
+            start = newline_positions[-1] + 1
+        elif colon_positions:
+            start = colon_positions[-1] + 1
+        else:
+            raise ValueError("no instruction boundary token found before [SEG]")
+    else:
+        start, end = next(iter(spans))
+        try:
+            seg_position = row.index(seg_id, end)
+        except ValueError as error:
+            raise ValueError("[SEG] token must appear after the query span") from error
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    mask[0, start : seg_position + 1] = True
+    return mask, seg_position
+
+
+def _rgb_batch(image: Image.Image, sample_id: str) -> RGBFrameBatch:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    frames = torch.from_numpy(array).permute(2, 0, 1).contiguous().unsqueeze(0).unsqueeze(0)
+    return RGBFrameBatch(
+        frames=frames,
+        frame_mask=torch.ones(1, 1, dtype=torch.bool),
+        sample_ids=(sample_id,),
+    )
+
+
+def _target_tensor(mask_path: Optional[str], device: torch.device) -> Tuple[torch.Tensor, bool]:
+    if mask_path is None:
+        return torch.zeros(1, 1, 1, 1, 1, dtype=torch.bool, device=device), False
+    array = np.asarray(Image.open(mask_path).convert("L"))
+    tensor = torch.from_numpy((array > 0).astype(np.uint8)).to(device=device, dtype=torch.bool)
+    return tensor[None, None, None], True
+
+
+def _image_sample(
+    record: Dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    template: str,
+    seg_id: int,
+    device: torch.device,
+):
+    image_path = Path(record["media_path"])
+    with Image.open(image_path) as handle:
+        image = handle.convert("RGB")
+    query = record["query"]
+    instruction = template.format(query=query) + " [SEG]"
+    conversation = [{"from": "human", "value": [image.copy(), instruction]}]
+    input_ids, media, media_config, attention_mask = _prepare_inputs(model, conversation)
+    query_mask, seg_position = _query_span_mask(input_ids, tokenizer, query, seg_id)
+    rgb = _rgb_batch(image, record["sample_id"])
+    target_mask, present = _target_tensor(record["mask_paths"][0], device)
+    return {
+        "input_ids": input_ids,
+        "media": media,
+        "media_config": media_config,
+        "attention_mask": attention_mask,
+        "query_mask": query_mask,
+        "seg_position": seg_position,
+        "rgb": rgb,
+        "target_mask": target_mask,
+        "target_presence": torch.tensor(
+            [[[present]]], dtype=torch.bool, device=device
+        ),
+        "sample_id": record["sample_id"],
+        "control_kind": record["control_kind"],
+    }
+
+
+def _video_sample(
+    record: Dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    template: str,
+    seg_id: int,
+    device: torch.device,
+):
+    media_dir = Path(record["media_path"])
+    frame_indices = [int(index) for index in record["frame_indices"]]
+    frames = []
+    for index in frame_indices:
+        frame_path = media_dir / f"{index:05d}.jpg"
+        try:
+            with Image.open(frame_path) as handle:
+                frames.append(handle.convert("RGB"))
+        except Exception:
+            # Missing or corrupt frame: substitute a neutral dark frame so the
+            # batch stays aligned with the manifest's sampled frame indices.
+            frames.append(Image.new("RGB", (1, 1), (0, 0, 0)))
+    # Normalize all frames to a common spatial size (some Ref-YT-VOS videos
+    # contain a corrupt 1x1 frame that breaks np.stack otherwise).
+    max_h = max(frame.height for frame in frames)
+    max_w = max(frame.width for frame in frames)
+    if any((frame.width, frame.height) != (max_w, max_h) for frame in frames):
+        frames = [frame.resize((max_w, max_h), Image.BILINEAR) for frame in frames]
+    query = record["query"]
+    instruction = template.format(query=query) + " [SEG]"
+    conversation = [{"from": "human", "value": frames + [instruction]}]
+    input_ids, media, media_config, attention_mask = _prepare_inputs(model, conversation)
+    query_mask, seg_position = _query_span_mask(input_ids, tokenizer, query, seg_id)
+    array = np.stack([np.asarray(frame, dtype=np.uint8).copy() for frame in frames])
+    rgb_frames = torch.from_numpy(array).permute(0, 3, 1, 2).contiguous().unsqueeze(0)
+    rgb = RGBFrameBatch(
+        frames=rgb_frames,
+        frame_mask=torch.ones(1, len(frames), dtype=torch.bool),
+        sample_ids=(record["sample_id"],),
+    )
+    target_masks = []
+    for mask_path in record["mask_paths"]:
+        tensor, present = _target_tensor(mask_path, device)
+        if not present:
+            tensor = torch.zeros(1, 1, 1, 1, 1, dtype=torch.bool, device=device)
+        # Normalize each mask to the common frame size: Ref-YT-VOS contains a
+        # few corrupt 1x1 masks that otherwise break torch.cat along frames
+        # (frames are already resized to max_w x max_h above).
+        if tensor.shape[-2] != max_h or tensor.shape[-1] != max_w:
+            tensor = (
+                torch.nn.functional.interpolate(
+                    tensor.float().squeeze(2), size=(max_h, max_w), mode="nearest"
+                )
+                > 0.5
+            ).unsqueeze(2)
+        target_masks.append(tensor)
+    if target_masks:
+        target = torch.cat(target_masks, dim=2)
+    else:
+        target = torch.zeros(1, 1, len(frames), 1, 1, dtype=torch.bool, device=device)
+    presence = torch.tensor(record["target_presence"], dtype=torch.bool, device=device).view(1, 1, -1)
+    return {
+        "input_ids": input_ids,
+        "media": media,
+        "media_config": media_config,
+        "attention_mask": attention_mask,
+        "query_mask": query_mask,
+        "seg_position": seg_position,
+        "rgb": rgb,
+        "target_mask": target,
+        "target_presence": presence,
+        "sample_id": record["sample_id"],
+        "control_kind": record["control_kind"],
+    }
+
+
+def _probe_conversations(model: Any, probe_media: Dict[str, Any]) -> List[Dict[str, Any]]:
+    image_paths = probe_media["image_paths"]
+    video_dir = probe_media["video_dir"]
+    image_items = []
+    for image_path in image_paths:
+        with Image.open(image_path) as handle:
+            image_items.append(handle.convert("RGB"))
+    from llava.media import Video
+
+    return [
+        [{"from": "human", "value": ["What is the capital of France?"]}],
+        [{"from": "human", "value": [image_items[0].copy(), "Describe this image in one sentence."]}],
+        [
+            {
+                "from": "human",
+                "value": [
+                    image_items[0].copy(),
+                    image_items[1].copy(),
+                    "Are these two images from the same scene?",
+                ],
+            }
+        ],
+        [
+            {
+                "from": "human",
+                "value": [Video(str(video_dir)), "Summarize the video in one sentence."],
+            }
+        ],
+    ]
+
+
+def _probe_logits(model: Any, conversation: List[Dict[str, Any]]) -> torch.Tensor:
+    input_ids, media, media_config, attention_mask = _prepare_inputs(model, conversation)
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            media=media,
+            media_config=media_config,
+            attention_mask=attention_mask,
+            packing=False,
+            output_hidden_states=False,
+            return_dict=True,
+            use_cache=False,
+        )
+    return outputs.logits[:, -1].detach().to(device="cpu", dtype=torch.float32)
+
+
+def _sam2_refine_trainable(
+    provider: SAM2ImageFeatureProvider,
+    rgb_frames: RGBFrameBatch,
+    coarse_logits: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run SAM2 mask decoder with autograd enabled for the mask-prompt path."""
+
+    predictor = provider._predictor
+    images = []
+    for batch_index, frame_index in rgb_frames.frame_mask.nonzero(as_tuple=False).tolist():
+        image = rgb_frames.frames[batch_index, frame_index].permute(1, 2, 0).contiguous().numpy()
+        images.append(image)
+    prompt_encoder = predictor.model.sam_prompt_encoder
+    mask_input_size = getattr(prompt_encoder, "mask_input_size", (256, 256))
+    valid_logits = coarse_logits[0, :, 0].unsqueeze(0)  # [1,N,H,W]
+    resized_logits = F.interpolate(
+        valid_logits.to(dtype=torch.float32, device=device),
+        size=(int(mask_input_size[0]), int(mask_input_size[1])),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mask_inputs = [item.detach().to(dtype=torch.float32, device="cpu").numpy() for item in resized_logits]
+    try:
+        predictor.set_image_batch(images)
+        prediction = predictor.predict_batch(
+            mask_input_batch=mask_inputs,
+            multimask_output=False,
+            return_logits=True,
+        )
+    finally:
+        predictor.reset_predictor()
+    if not isinstance(prediction, (tuple, list)) or not prediction:
+        raise RuntimeError("SAM2 predict_batch did not return mask logits")
+    masks = prediction[0]
+    if not isinstance(masks, (tuple, list)) or len(masks) != 1:
+        raise RuntimeError("SAM2 refined mask batch does not match one image")
+    tensor = torch.as_tensor(masks[0], device=device, dtype=coarse_logits.dtype)
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)  # [1,H,W]
+    if tensor.ndim == 4 and tensor.shape[1] == 1:
+        tensor = tensor.squeeze(1)  # [N,H,W]
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(1)  # [N,1,H,W]
+    return tensor.unsqueeze(0)  # [1,N,1,H,W]
+
+
+def _mask_iou(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    if target.numel() == 0 or target.dtype != torch.bool:
+        return 0.0
+    predicted = (prediction > 0).to(device=target.device, dtype=torch.bool)
+    resized = F.interpolate(
+        target.to(dtype=torch.float32)[None, None],
+        size=prediction.shape[-2:],
+        mode="nearest",
+    ).squeeze(0).squeeze(0) > 0
+    intersection = (predicted & resized).sum().float().item()
+    union = (predicted | resized).sum().float().item()
+    return intersection / union if union > 0 else 0.0
+
+
+def _run(
+    config: Dict[str, Any],
+    config_path: Path,
+    *,
+    vila_model_path: Path,
+    sam2_source_root: Path,
+    sam2_checkpoint: Path,
+    manifest_dir: Path,
+    output_dir: Path,
+    device_text: str,
+    retention_image_paths: Optional[List[str]] = None,
+    retention_video_dir: Optional[str] = None,
+    video_manifest_dir_text: Optional[str] = None,
+    no_object_image_manifest: Optional[Path] = None,
+    resume: bool = False,
+    wandb_project: Optional[str] = None,
+    seed_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    device, rank, world_size = _setup_distributed(device_text)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("S4b training requires an available CUDA device")
+    seed = int(config.get("seed", 0))
+    if seed_override is not None:
+        seed = int(seed_override)
+    seed = seed + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.cuda.init()  # ensure a CUDA context exists before querying memory stats
+    torch.cuda.reset_peak_memory_stats(device)
+
+    import llava
+
+    model, vila_initialization_ms = _timed_call(
+        device,
+        lambda: llava.load(
+            str(vila_model_path), device=str(device), device_map={"": str(device)}
+        ),
+    )
+    print(f"[train] model loaded in {vila_initialization_ms:.0f} ms", flush=True)
+    model.eval()
+    model.requires_grad_(False)
+    # VILA is natively a mixed bf16/FP8 model (QuantLinearTE casts to bf16).
+    # Running the fp16 residual stream under fp16 autocast overflows to Inf for
+    # some samples (fp16 max ~65504), and the final RMSNorm turns Inf into NaN
+    # (Inf * 0).  Convert the whole frozen backbone to bf16 so the training
+    # forward is numerically stable; the fp32 segmentation stack is unaffected.
+    model.to(torch.bfloat16)
+
+    tokenizer = model.tokenizer
+    seg_id = tokenizer.convert_tokens_to_ids("[SEG]")
+    if seg_id == tokenizer.unk_token_id:
+        tokenizer.add_special_tokens({"additional_special_tokens": ["[SEG]"]})
+        seg_id = tokenizer.convert_tokens_to_ids("[SEG]")
+        llm = model.get_llm()
+        llm.resize_token_embeddings(len(tokenizer))
+        print("[train] tokenizer resized with [SEG]", flush=True)
+    llm_for_embeddings = model.get_llm()
+    embed_module = getattr(getattr(llm_for_embeddings, "model", llm_for_embeddings), "embed_tokens")
+
+    training = config.get("training", {})
+    lora = config.get("lora", {})
+    decoder_config = dict(config.get("decoder", {}))
+    sam2_config = dict(config.get("sam2", {}))
+    prompt_config = dict(config.get("prompt", {}))
+    template = str(prompt_config.get("instruction_template", "Segment the object described by this referring expression: {query}."))
+
+    probe_media = dict(config.get("retention_probes", {}))
+    if retention_image_paths:
+        probe_media["image_paths"] = retention_image_paths
+    if retention_video_dir:
+        probe_media["video_dir"] = retention_video_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    baseline_logits = None
+    baseline_path = output_dir / "retention_baseline.pt"
+    if rank == 0:
+        if resume and baseline_path.exists():
+            baseline_logits = torch.load(baseline_path, map_location="cpu")
+            print("[train] loaded existing retention baselines for resume", flush=True)
+        else:
+            probe_conversations = _probe_conversations(model, probe_media)
+            print("[train] building retention baselines", flush=True)
+            baseline_logits = [_probe_logits(model, conversation) for conversation in probe_conversations]
+            print("[train] retention baselines captured", flush=True)
+            torch.save(baseline_logits, baseline_path)
+    provider = SAM2ImageFeatureProvider(
+        {
+            "source_root": str(sam2_source_root),
+            "model_config": sam2_config["model_config"],
+            "checkpoint_path": str(sam2_checkpoint),
+            "device": str(device),
+            "apply_postprocessing": bool(sam2_config.get("apply_postprocessing", True)),
+        }
+    )
+    _, sam2_initialization_ms = _timed_call(device, provider.initialize)
+    print("[train] SAM2 initialized", flush=True)
+
+    head = str(config.get("head", "query_decoder"))
+    if head == "lisa":
+        decoder = Sam2LisaHead(
+            hidden_size=int(model.llm.config.hidden_size),
+            sam2_model=provider._predictor.model,
+            prompt_dim=int(decoder_config.get("feature_dim", 256)),
+        ).to(device=device, dtype=torch.float32)
+        projector = torch.nn.Identity()  # no projector needed in the LISA path
+        print("[train] head=sam2_lisa ([SEG] state -> SAM2 mask decoder)", flush=True)
+    else:
+        decoder = QueryConditionedSpatialDecoder(
+            query_dim=int(model.llm.config.hidden_size),
+            feature_dim=int(decoder_config.get("feature_dim", 256)),
+            model_dim=int(decoder_config.get("model_dim", 128)),
+            num_heads=int(decoder_config.get("num_heads", 8)),
+            num_layers=int(decoder_config.get("num_layers", 2)),
+            num_object_queries=int(decoder_config.get("num_object_queries", 1)),
+            dropout=float(decoder_config.get("dropout", 0.0)),
+        ).to(device=device)
+        projector = GroundingProjector(hidden_size=int(model.llm.config.hidden_size)).to(device=device)
+    seg_injector = SegEmbeddingInjector(embed_module, seg_id, int(model.llm.config.hidden_size))
+    seg_injector.seg_embedding = torch.nn.Parameter(seg_injector.seg_embedding.detach().to(device))
+    print("[train] trainable components attached", flush=True)
+
+    llm = model.get_llm()
+    llm_layers = getattr(getattr(llm, "model", llm), "layers")
+    full_rank = bool(lora.get("full_rank", False))
+    lora_rank = None if full_rank else int(lora.get("rank", 8))
+    lora_alpha = None if full_rank else float(lora.get("alpha", 16))
+    lora_layers_n = int(lora.get("layers", 8))
+    lora_proj = list(lora.get("projections", ["self_attn.q_proj", "self_attn.v_proj"]))
+    lora_layers = list(llm_layers[-lora_layers_n:])
+    lora_adapters, lora_handles = apply_lora(
+        lora_layers, lora_proj, lora_rank, lora_alpha
+    )
+    if bool(lora.get("vision_lora", False)):
+        vision_model = model.vision_tower.vision_tower.vision_model
+        vision_layers = list(vision_model.encoder.layers)
+        v_rank = None if full_rank else int(lora.get("vision_rank", 16))
+        v_alpha = None if full_rank else float(lora.get("vision_alpha", 32))
+        v_adapters, v_handles = apply_lora(
+            vision_layers,
+            ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"],
+            v_rank,
+            v_alpha,
+            key_prefix="vision_",
+        )
+        for key, adapters_list in v_adapters.items():
+            lora_adapters.setdefault(key, []).extend(adapters_list)
+        lora_handles.extend(v_handles)
+        print(
+            f"[train] vision-tower LoRA attached on {len(vision_layers)} layers "
+            f"(rank={'full' if full_rank else v_rank})",
+            flush=True,
+        )
+
+    sam2_mask_decoder_trainable = bool(training.get("sam2_mask_decoder_trainable", False))
+    sam2_mask_decoder_params: List[torch.nn.Parameter] = []
+    if sam2_mask_decoder_trainable:
+        mask_decoder = provider._predictor.model.sam_mask_decoder
+        for parameter in mask_decoder.parameters():
+            parameter.requires_grad_(True)
+        # The LISA head owns sam_mask_decoder as a submodule (Sam2LisaHead),
+        # so decoder.parameters() already includes the mask decoder.  Adding
+        # it again to a separate optimizer group would double-update it every
+        # step; only the standalone (query-decoder) head needs its own group.
+        if str(config.get("head", "query_decoder")) != "lisa":
+            sam2_mask_decoder_params.extend(mask_decoder.parameters())
+
+    capability = SegmentationCapability(decoder)
+    adapter = VILASegmentationAdapter(model, provider, capability)
+    policy = SegTrainingPolicy(
+        lora_adapters=lora_adapters,
+        lora_handles=lora_handles,
+        seg_injector=seg_injector,
+        projector=projector,
+        decoder=decoder,
+        sam2_mask_decoder=sam2_mask_decoder_params,
+        sam2_mask_decoder_trainable=sam2_mask_decoder_trainable,
+    )
+    optimizer = torch.optim.AdamW(
+        policy.optimizer_param_groups(
+            float(training.get("lora_lr", 1e-4)),
+            float(training.get("lr", 1e-4)),
+        ),
+        weight_decay=float(training.get("weight_decay", 0.0)),
+    )
+    start_step = 0
+    resume_ckpt = output_dir / "checkpoint_latest.pt"
+    if resume and resume_ckpt.exists():
+        state = torch.load(resume_ckpt, map_location="cpu")
+        decoder.load_state_dict(state["decoder"])
+        projector.load_state_dict(state["projector"])
+        with torch.no_grad():
+            seg_injector.seg_embedding.copy_(state["seg_embedding"].to(device))
+        saved_lora = state.get("lora", {})
+        for name, adapters in lora_adapters.items():
+            if name not in saved_lora:
+                continue
+            for index, lora_adapter in enumerate(adapters):
+                lora_adapter.load_state_dict(saved_lora[name][index])
+        if sam2_mask_decoder_trainable and state.get("sam2_mask_decoder"):
+            with torch.no_grad():
+                for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters():
+                    if name in state["sam2_mask_decoder"]:
+                        parameter.copy_(state["sam2_mask_decoder"][name].to(device))
+        if state.get("optimizer"):
+            optimizer.load_state_dict(state["optimizer"])
+        start_step = int(state.get("step", 0))
+        print(f"[train] resumed from step {start_step} ({resume_ckpt})", flush=True)
+    elif resume:
+        print(
+            f"[train] WARNING --resume requested but {resume_ckpt} does not exist; starting fresh",
+            flush=True,
+        )
+
+    train_records = [
+        json.loads(line)
+        for line in (manifest_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    val_records = [
+        json.loads(line)
+        for line in (manifest_dir / "val.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    train_records = [record for record in train_records if record["control_kind"] != "empty_query"]
+    train_positives = [record for record in train_records if record["control_kind"] == "positive"]
+    train_negatives = [record for record in train_records if record["control_kind"] == "no_object"]
+    if no_object_image_manifest is not None:
+        extra_negatives = [
+            json.loads(line)
+            for line in no_object_image_manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        existing_ids = {record["sample_id"] for record in train_negatives}
+        train_negatives.extend(
+            record for record in extra_negatives if record["sample_id"] not in existing_ids
+        )
+        print(f"[train] loaded {len(extra_negatives)} no-object image negatives", flush=True)
+    if not train_positives:
+        raise ValueError("manifest contains no positive training records")
+    task = str(config.get("task", "image"))
+    mixed = task == "mixed"
+    if mixed and int(training.get("fixed_subset", 0)) > 0:
+        raise ValueError("mixed training requires fixed_subset=0")
+    image_manifest_dir = manifest_dir
+    video_manifest_dirs = (
+        [Path(part.strip()) for part in video_manifest_dir_text.split(",") if part.strip()]
+        if video_manifest_dir_text
+        else ([manifest_dir] if task == "video" else [])
+    )
+    video_manifest_dir = video_manifest_dirs[0] if video_manifest_dirs else None
+    if mixed and video_manifest_dir is None:
+        raise ValueError("mixed training requires --video-manifest-dir")
+    image_loader = _image_sample
+    video_loader = _video_sample
+    rng = random.Random(seed)
+    fixed_subset = int(training.get("fixed_subset", 0))
+    if fixed_subset > 0:
+        rng.shuffle(train_positives)
+        train_positives = train_positives[:fixed_subset]
+        print(f"[train] fixed-subset overfit on {len(train_positives)} samples", flush=True)
+
+    video_train_records = []
+    for vdir in video_manifest_dirs:
+        if not (vdir / "train.jsonl").exists():
+            continue
+        vrecords = [
+            json.loads(line)
+            for line in (vdir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        vrecords = [record for record in vrecords if record["control_kind"] != "empty_query"]
+        train_positives.extend(record for record in vrecords if record["control_kind"] == "positive")
+        train_negatives.extend(record for record in vrecords if record["control_kind"] == "no_object")
+        video_train_records.extend(vrecords)
+        print(f"[train] loaded {len(vrecords)} video records from {vdir}", flush=True)
+
+    image_positives = [record for record in train_positives if record["media_type"] == "image"]
+    video_positives = [record for record in train_positives if record["media_type"] == "video"]
+    image_negatives = [record for record in train_negatives if record["media_type"] == "image"]
+    video_negatives = [record for record in train_negatives if record["media_type"] == "video"]
+    records_by_id = {record["sample_id"]: record for record in train_records}
+    if video_train_records:
+        records_by_id.update({record["sample_id"]: record for record in video_train_records})
+
+    pair_map: Dict[str, str] = {}
+    pair_paths = [image_manifest_dir / "train.pairs.jsonl"] + [
+        vdir / "train.pairs.jsonl" for vdir in video_manifest_dirs
+    ]
+    for pairs_path in pair_paths:
+        if pairs_path is None or not pairs_path.exists():
+            continue
+        for line in pairs_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            pair = json.loads(line)
+            left, right = pair["left_sample_id"], pair["right_sample_id"]
+            pair_map[left] = right
+            pair_map[right] = left
+    grad_accum = max(1, int(training.get("grad_accum", 1)))
+    epoch_cycle = bool(training.get("epoch_cycle", False))
+    print(f"[train] pools image_pos={len(image_positives)} video_pos={len(video_positives)} "
+          f"image_neg={len(image_negatives)} video_neg={len(video_negatives)} "
+          f"pairs={len(pair_map) // 2}", flush=True)
+    if epoch_cycle:
+        train_pos_cyc = _CyclicPool(train_positives, rng)
+        train_neg_cyc = _CyclicPool(train_negatives, rng)
+        image_pos_cyc = _CyclicPool(image_positives, rng)
+        image_neg_cyc = _CyclicPool(image_negatives, rng)
+        video_pos_cyc = _CyclicPool(video_positives, rng)
+        video_neg_cyc = _CyclicPool(video_negatives, rng)
+    else:
+        train_pos_cyc = train_neg_cyc = None
+        image_pos_cyc = image_neg_cyc = None
+        video_pos_cyc = video_neg_cyc = None
+
+    steps = int(training.get("steps", 500))
+    log_every = int(training.get("log_every", 10))
+    eval_every = int(training.get("eval_every", 25))
+    save_every = int(training.get("save_every", 1000))
+    loss_weights = dict(config.get("loss_weights", {"bce": 1.0, "dice": 1.0, "objectness": 0.1}))
+    refined_weight = float(training.get("refined_mask_weight", 0.5))
+    spatial_scale = int(decoder_config.get("spatial_scale", 1))
+    hidden_layer = int(training.get("hidden_layer", -1))
+    mix_video_ratio = float(training.get("mix_video_ratio", 0.5))
+    no_object_ratio = float(training.get("no_object_ratio", 0.15))
+    swap_prob = float(training.get("swap_prob", 0.25))
+    swap_weight = float(loss_weights.get("query_swap", 0.0))
+    seg_loss_weights = dict(loss_weights)
+    seg_loss_weights.pop("query_swap", None)
+
+    def run_forward(sample: Dict[str, Any], sample_task: str, with_loss: bool = True):
+        # VILA forward runs in bf16 (native model precision); the segmentation
+        # stack (projector/decoder/losses) runs in fp32 to avoid overflow.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            query_states = adapter.extract_query_states_training(
+                sample["input_ids"],
+                sample["media"],
+                sample["media_config"],
+                sample["query_mask"],
+                sample["attention_mask"],
+                hidden_layer=hidden_layer,
+            )
+        seg_positions = (
+            sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
+        ).to(dtype=torch.long, device=device)
+        query_states_raw = query_states.states.to(dtype=torch.float32)
+        if not torch.isfinite(query_states_raw).all():
+            query_states_raw = torch.nan_to_num(query_states_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        dense = provider.encode_frames(sample["rgb"])
+        if head == "lisa":
+            seg_state = query_states_raw[
+                torch.arange(query_states_raw.shape[0], device=device), seg_positions
+            ]
+            result = decoder(
+                seg_state,
+                dense.features,
+                dense.frame_mask,
+                dense.high_res_features,
+            )
+            batch = GroundingBatch(
+                query_states=seg_state.unsqueeze(1),
+                query_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
+                dense_features=dense.features.to(dtype=torch.float32),
+                frame_mask=dense.frame_mask,
+                target_masks=sample["target_mask"] if with_loss else None,
+                target_presence=sample["target_presence"] if with_loss else None,
+                sample_ids=(sample["sample_id"],),
+            )
+            losses = compute_segmentation_loss(result, batch, seg_loss_weights) if with_loss else None
+            return result, losses, batch
+        projected = projector(query_states_raw, query_states.mask, seg_positions)
+        dense = _upsample_dense(dense, spatial_scale)
+        dense_features = dense.features.to(dtype=torch.float32)
+        if not torch.isfinite(dense_features).all():
+            dense_features = torch.nan_to_num(dense_features, nan=0.0, posinf=0.0, neginf=0.0)
+        batch = GroundingBatch(
+            query_states=projected,
+            query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
+            dense_features=dense_features,
+            frame_mask=dense.frame_mask,
+            target_masks=sample["target_mask"] if with_loss else None,
+            target_presence=sample["target_presence"] if with_loss else None,
+            sample_ids=(sample["sample_id"],),
+        )
+        result = capability(batch, {"enabled": True, "task": sample_task})
+        losses = compute_segmentation_loss(result, batch, seg_loss_weights) if with_loss else None
+        return result, losses, batch
+
+    logger = TrainingLogger(output_dir) if rank == 0 else None
+    tb_writer = None
+    run_wandb = None
+    if rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+        except Exception:  # tensorboard is an optional dependency
+            tb_writer = None
+        if wandb_project:
+            try:
+                import wandb
+
+                run_wandb = wandb.init(
+                    project=wandb_project,
+                    config={
+                        "output": str(output_dir),
+                        "head": str(config.get("head", "query_decoder")),
+                        "steps": steps,
+                        "config_path": str(config_path),
+                    },
+                    reinit=True,
+                    settings=wandb.Settings(start_method="fork"),
+                )
+            except Exception as error:
+                print(f"[train] wandb init failed (continuing without wandb): {error}", flush=True)
+                run_wandb = None
+    history: List[Dict[str, Any]] = []
+    history_file = output_dir / "train_history.jsonl"
+    if rank == 0:
+        if history_file.exists() and start_step == 0:
+            history_file.unlink()
+        logger.message(
+            f"starting training loop task={task} steps={steps} world_size={world_size} "
+            f"mix_video_ratio={mix_video_ratio} no_object_ratio={no_object_ratio} "
+            f"swap_prob={swap_prob} swap_weight={swap_weight}"
+        )
+    optimizer.zero_grad(set_to_none=True)
+    step = start_step
+    progress = tqdm(
+        range(steps),
+        desc=f"S4b rank{rank}",
+        disable=(rank != 0),
+        ncols=110,
+    )
+    if start_step > 0:
+        progress.update(start_step)
+    while step < steps:
+        accum_loss = 0.0
+        accum_bce = 0.0
+        accum_dice = 0.0
+        accum_objectness = 0.0
+        accum_temporal = 0.0
+        accum_swap = 0.0
+        accum_iou = 0.0
+        micro_done = 0
+        skips_in_row = 0
+        last_record = None
+        last_sample_task = "image"
+        while micro_done < grad_accum and step < steps:
+            if epoch_cycle:
+                if mixed:
+                    if rng.random() < mix_video_ratio:
+                        sample_task, pos_pool, neg_pool = "video", video_pos_cyc, video_neg_cyc
+                    else:
+                        sample_task, pos_pool, neg_pool = "image", image_pos_cyc, image_neg_cyc
+                    if neg_pool is not None and neg_pool.size and rng.random() < no_object_ratio:
+                        record = neg_pool.next()
+                    else:
+                        record = pos_pool.next()
+                else:
+                    sample_task = task
+                    pos_pool = train_pos_cyc
+                    neg_pool = train_neg_cyc
+                    if neg_pool is not None and neg_pool.size and rng.random() < no_object_ratio:
+                        record = neg_pool.next()
+                    else:
+                        record = pos_pool.next()
+            elif mixed:
+                if rng.random() < mix_video_ratio:
+                    sample_task, pos_pool, neg_pool = "video", video_positives, video_negatives
+                else:
+                    sample_task, pos_pool, neg_pool = "image", image_positives, image_negatives
+                if neg_pool and rng.random() < no_object_ratio:
+                    record = rng.choice(neg_pool)
+                else:
+                    record = rng.choice(pos_pool)
+            else:
+                sample_task = task
+                if fixed_subset > 0:
+                    record = train_positives[(step * world_size + rank) % len(train_positives)]
+                elif train_negatives and rng.random() < no_object_ratio:
+                    record = rng.choice(train_negatives)
+                else:
+                    record = rng.choice(train_positives)
+            loader = video_loader if sample_task == "video" else image_loader
+            sample = loader(record, model, tokenizer, template, seg_id, device)
+            decoder.train()
+            projector.train()
+            swap_value = 0.0
+            try:
+                with seg_training_active(True):
+                    result, losses, batch = run_forward(sample, sample_task)
+                    total_loss = losses["total"]
+                    if not torch.isfinite(total_loss):
+                        raise ValueError("non-finite total loss")
+                    if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
+                        anchor_rgb = RGBFrameBatch(
+                            frames=sample["rgb"].frames[:, :1],
+                            frame_mask=torch.ones(1, 1, dtype=torch.bool),
+                            sample_ids=(sample["sample_id"],),
+                        )
+                        refined = _sam2_refine_trainable(
+                            provider, anchor_rgb, result.mask_logits[:, :, :1], device
+                        )
+                        refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
+                        refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
+                        refined_loss = (
+                            binary_mask_loss(refined, refined_target, refined_valid)
+                            + dice_loss(refined, refined_target, refined_valid)
+                        ) * refined_weight
+                        total_loss = total_loss + refined_loss
+                    if (
+                        swap_weight > 0
+                        and record["control_kind"] == "positive"
+                        and rng.random() < swap_prob
+                    ):
+                        partner_id = pair_map.get(record["sample_id"])
+                        partner = records_by_id.get(partner_id) if partner_id else None
+                        if partner is not None:
+                            swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
+                            swapped_result, _, _ = run_forward(swapped_sample, sample_task)
+                            valid_swap = batch.frame_mask[:, None, :]
+                            if batch.target_presence is not None:
+                                valid_swap = batch.target_presence & valid_swap
+                            swap_loss = query_swap_margin_loss(
+                                result.mask_logits,
+                                swapped_result.mask_logits,
+                                batch.target_masks,
+                                valid_swap,
+                                margin=float(training.get("swap_margin", 0.1)),
+                            )
+                            total_loss = total_loss + swap_loss * swap_weight
+                            swap_value = float(swap_loss.detach().item())
+            except (ValueError, RuntimeError) as error:
+                message = str(error)
+                if (
+                    "must contain only finite values" not in message
+                    and "Sizes of tensors must match" not in message
+                    and "non-finite total loss" not in message
+                ):
+                    raise
+                skips_in_row += 1
+                if skips_in_row > 200:
+                    raise RuntimeError(f"too many consecutive skipped samples: {message[:200]}")
+                if logger is not None:
+                    logger.message(
+                        f"step {step} SKIPPED bad sample {record['sample_id']} ({sample_task}): {message[:120]}"
+                    )
+                continue
+            skips_in_row = 0
+            (total_loss / grad_accum).backward()
+            micro_done += 1
+            last_record = record
+            last_sample_task = sample_task
+            accum_loss += float(total_loss.detach().item())
+            accum_bce += float(losses["bce"].detach().item())
+            accum_dice += float(losses["dice"].detach().item())
+            accum_objectness += float(losses["objectness"].detach().item())
+            accum_temporal += float(losses["temporal"].detach().item())
+            accum_swap += swap_value
+            accum_iou += _mask_iou(
+                result.mask_logits[0, 0, 0].detach(),
+                sample["target_mask"][0, 0, 0].detach()
+                if record["control_kind"] == "positive"
+                else torch.zeros(1, 1, dtype=torch.bool, device=device),
+            )
+        if micro_done == 0:
+            step += 1
+            progress.update(1)
+            continue
+        _sync_gradients(optimizer, world_size)
+        param_names = {id(parameter): name for name, parameter in model.named_parameters()}
+        nan_grads = [
+            f"{param_names.get(id(parameter), group['name'])}:{parameter.grad.abs().max().item():.3e}"
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+        ]
+        if nan_grads:
+            if logger is not None:
+                logger.message(f"step {step} NON-FINITE grads, skipping optimizer step: {nan_grads[:5]}")
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            progress.update(1)
+            continue
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for group in optimizer.param_groups for parameter in group["params"]],
+                float(training.get("grad_clip", 1.0)),
+            ).item()
+        )
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        nan_params = [
+            f"{group['name']}:{parameter.abs().max().item():.3e}"
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if not torch.isfinite(parameter).all()
+        ]
+        if nan_params:
+            if logger is not None:
+                logger.message(f"step {step} NON-FINITE params: {nan_params[:5]}")
+
+        record = last_record
+        sample_task = last_sample_task
+        anchor_iou = accum_iou / max(1, micro_done)
+        progress.update(1)
+        progress.set_postfix(
+            loss=accum_loss / max(1, micro_done),
+            iou=anchor_iou,
+            bce=accum_bce / max(1, micro_done),
+            dice=accum_dice / max(1, micro_done),
+            swap=accum_swap / max(1, micro_done),
+        )
+        history_entry = {
+            "step": step,
+            "source": sample_task,
+            "loss": accum_loss / max(1, micro_done),
+            "bce": accum_bce / max(1, micro_done),
+            "dice": accum_dice / max(1, micro_done),
+            "objectness": accum_objectness / max(1, micro_done),
+            "temporal": accum_temporal / max(1, micro_done),
+            "swap": accum_swap / max(1, micro_done),
+            "anchor_iou": anchor_iou,
+            "control_kind": record["control_kind"],
+            "sample_id": record["sample_id"],
+            "micro_batches": micro_done,
+        }
+        if rank == 0:
+            history.append(history_entry)
+            with history_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(history_entry) + "\n")
+            if step % log_every == 0 or step == steps - 1:
+                remaining = progress.format_dict.get("remaining")
+                logger.step(
+                    step=step,
+                    total=steps,
+                    source=sample_task,
+                    sample=record["sample_id"],
+                    kind=record["control_kind"],
+                    loss=round(history_entry["loss"], 4),
+                    bce=round(history_entry["bce"], 4),
+                    dice=round(history_entry["dice"], 4),
+                    objectness=round(history_entry["objectness"], 4),
+                    temporal=round(history_entry["temporal"], 4),
+                    swap=round(history_entry["swap"], 4),
+                    iou=round(anchor_iou, 3),
+                    lr=optimizer.param_groups[0]["lr"],
+                    gnorm=round(grad_norm, 3),
+                    eta=remaining,
+                )
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss", history_entry["loss"], step)
+                    tb_writer.add_scalar("train/iou", anchor_iou, step)
+                    tb_writer.add_scalar("train/bce", history_entry["bce"], step)
+                    tb_writer.add_scalar("train/dice", history_entry["dice"], step)
+                    tb_writer.add_scalar("train/objectness", history_entry["objectness"], step)
+                    tb_writer.add_scalar("train/temporal", history_entry["temporal"], step)
+                    tb_writer.add_scalar("train/swap", history_entry["swap"], step)
+                    tb_writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], step)
+                    tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+                if run_wandb is not None:
+                    run_wandb.log(
+                        {
+                            "train/loss": history_entry["loss"],
+                            "train/iou": anchor_iou,
+                            "train/bce": history_entry["bce"],
+                            "train/dice": history_entry["dice"],
+                            "train/objectness": history_entry["objectness"],
+                            "train/temporal": history_entry["temporal"],
+                            "train/swap": history_entry["swap"],
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/grad_norm": grad_norm,
+                            "step": step,
+                        },
+                        step=step,
+                    )
+        if rank == 0 and (step % eval_every == 0 or step == steps - 1):
+            for eval_task, eval_dir, eval_loader in (
+                ("image", image_manifest_dir, image_loader),
+                ("video", video_manifest_dir, video_loader),
+            ):
+                if eval_dir is None or not (eval_dir / "val.jsonl").exists():
+                    continue
+                eval_records = [
+                    json.loads(line)
+                    for line in (eval_dir / "val.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip() and json.loads(line)["control_kind"] == "positive"
+                ]
+                if not eval_records:
+                    continue
+                decoder.eval()
+                projector.eval()
+                ious = []
+                for eval_record in rng.sample(eval_records, min(10, len(eval_records))):
+                    try:
+                        eval_sample = eval_loader(eval_record, model, tokenizer, template, seg_id, device)
+                        with torch.no_grad(), seg_training_active(True):
+                            eval_result, _, _ = run_forward(eval_sample, eval_task, with_loss=False)
+                    except (ValueError, RuntimeError):
+                        continue
+                    ious.append(
+                        _mask_iou(
+                            eval_result.mask_logits[0, 0, 0].detach(),
+                            eval_sample["target_mask"][0, 0, 0].detach(),
+                        )
+                    )
+                val_iou = float(np.mean(ious)) if ious else 0.0
+                logger.message(
+                    f"eval step={step} task={eval_task} val_iou={val_iou:.4f} n={len(ious)}"
+                )
+                history_entry.setdefault("eval", {})[eval_task] = round(val_iou, 4)
+                if tb_writer is not None:
+                    tb_writer.add_scalar(f"eval/val_iou_{eval_task}", val_iou, step)
+                if run_wandb is not None:
+                    run_wandb.log({f"eval/val_iou_{eval_task}": val_iou, "step": step}, step=step)
+        step += 1
+        if rank == 0 and save_every > 0 and step % save_every == 0:
+            periodic = {
+                "step": step,
+                "decoder": decoder.state_dict(),
+                "projector": projector.state_dict(),
+                "seg_embedding": seg_injector.seg_embedding.detach().cpu(),
+                "lora": {
+                    name: [adapter.state_dict() for adapter in adapters]
+                    for name, adapters in lora_adapters.items()
+                },
+                "sam2_mask_decoder": (
+                    {
+                        name: parameter.detach().cpu().clone()
+                        for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters()
+                    }
+                    if sam2_mask_decoder_trainable
+                    else {}
+                ),
+                "optimizer": optimizer.state_dict(),
+            }
+            torch.save(periodic, output_dir / "checkpoint_latest.pt")
+            logger.message(f"step {step} checkpoint saved to checkpoint_latest.pt")
+    progress.close()
+
+    retention_checks: List[Dict[str, Any]] = []
+    if rank == 0:
+        decoder.eval()
+        projector.eval()
+        after_conversations = _probe_conversations(model, probe_media)
+        after_logits = [_probe_logits(model, conversation) for conversation in after_conversations]
+        for index, (before, after) in enumerate(zip(baseline_logits, after_logits)):
+            equal = torch.equal(before, after)
+            diff = float((before - after).abs().max().item())
+            retention_checks.append({"probe": index, "exact": bool(equal), "max_abs_diff": diff})
+            if not equal:
+                print(f"WARNING retention probe {index} changed by {diff}")
+
+    if rank == 0:
+        checkpoint = {
+            "decoder": decoder.state_dict(),
+            "projector": projector.state_dict(),
+            "seg_embedding": seg_injector.seg_embedding.detach().cpu(),
+            "lora": {
+                name: [adapter.state_dict() for adapter in adapters]
+                for name, adapters in lora_adapters.items()
+            },
+            "sam2_mask_decoder": (
+                {
+                    name: parameter.detach().cpu().clone()
+                    for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters()
+                }
+                if sam2_mask_decoder_trainable
+                else {}
+            ),
+        }
+        torch.save(checkpoint, output_dir / "s4b_t1_checkpoint.pt")
+
+        summary = {
+            "git_commit": _git_commit(_repo_root()),
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "seed": seed,
+            "world_size": world_size,
+            "steps_completed": steps,
+            "training": {
+                "sam2_mask_decoder_trainable": sam2_mask_decoder_trainable,
+                "lora_rank": int(lora.get("rank", 8)),
+                "lora_layers": len(lora_layers),
+                "freeze_summary": policy.freeze_state_summary(model),
+            },
+            "retention": retention_checks,
+            "final_metrics": {
+                "last_train_loss": history[-1]["loss"] if history else None,
+                "last_train_iou": history[-1]["anchor_iou"] if history else None,
+                "val_iou": history[-1].get("val_iou") if history else None,
+            },
+            "history": history,
+            "environment": {
+                "python": sys.version.split()[0],
+                "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
+                "device": torch.cuda.get_device_name(device),
+            },
+            "assets": {
+                "vila_model_name": vila_model_path.name,
+                "sam2_checkpoint_name": sam2_checkpoint.name,
+            },
+            "peak_memory_mib": torch.cuda.max_memory_allocated(device) / 1024**2,
+            "vila_initialization_ms": vila_initialization_ms,
+            "sam2_initialization_ms": sam2_initialization_ms,
+        }
+        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        if tb_writer is not None:
+            tb_writer.close()
+        if run_wandb is not None:
+            run_wandb.finish()
+        return summary
+    return {}
+
+
+def _align_targets_for_refine(target: torch.Tensor, refined: torch.Tensor, device: torch.device) -> torch.Tensor:
+    squeezed = target[0].to(dtype=torch.float32, device=device)  # [1,1,H,W]
+    aligned = F.interpolate(
+        squeezed,
+        size=refined.shape[-2:],
+        mode="nearest",
+    ).unsqueeze(0)
+    return aligned
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=_repo_root() / "configs/evo_seg/s4b_t1_image.yaml")
+    parser.add_argument("--vila-model", type=Path, required=True)
+    parser.add_argument("--sam2-source-root", type=Path, required=True)
+    parser.add_argument("--sam2-checkpoint", type=Path, required=True)
+    parser.add_argument("--manifest-dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--resume", action="store_true", help="resume from checkpoint_latest.pt in --output")
+    parser.add_argument("--retention-image-paths", nargs="+", default=None)
+    parser.add_argument("--retention-video-dir", default=None)
+    parser.add_argument("--video-manifest-dir", default=None)
+    parser.add_argument("--no-object-image-manifest", default=None, help="extra no_object image records (jsonl)")
+    parser.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        help="enable torch.autograd.set_detect_anomaly to trace the first non-finite gradient",
+    )
+    parser.add_argument("--wandb-project", default=None, help="optional wandb project name for live curves")
+    parser.add_argument("--seed", type=int, default=None, help="override config seed (useful for parallel per-GPU runs)")
+    args = parser.parse_args(argv)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+    config_path = args.config.expanduser().resolve()
+    output_dir = args.output.expanduser().resolve()
+    try:
+        output_dir.relative_to(_repo_root().resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError("training output must be outside the repository")
+    _run(
+        _load_config(config_path),
+        config_path,
+        vila_model_path=args.vila_model.expanduser().resolve(),
+        sam2_source_root=args.sam2_source_root.expanduser().resolve(),
+        sam2_checkpoint=args.sam2_checkpoint.expanduser().resolve(),
+        manifest_dir=args.manifest_dir.expanduser().resolve(),
+        output_dir=output_dir,
+        device_text=args.device,
+        retention_image_paths=args.retention_image_paths,
+        retention_video_dir=args.retention_video_dir,
+        video_manifest_dir_text=args.video_manifest_dir,
+        no_object_image_manifest=(
+            Path(args.no_object_image_manifest).expanduser().resolve()
+            if args.no_object_image_manifest
+            else None
+        ),
+        resume=args.resume,
+        wandb_project=args.wandb_project,
+        seed_override=args.seed,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

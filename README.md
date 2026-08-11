@@ -8,6 +8,50 @@
 
 [arXiv](https://arxiv.org/abs/2412.04468) / [Demo](https://vila.hanlab.ai/) / [Models](https://huggingface.co/collections/Efficient-Large-Model/nvila-674f8163543890b35a91b428) / [Subscribe](https://forms.gle/6nf1QdPYdvC2vgxM8)
 
+## EvoVILA-Seg Extension
+
+The `EvoVILA-Seg` branch is adding opt-in language-conditioned image and video
+segmentation while preserving the original VILA request path. S0 provides the
+SAM2-free tensor contracts, query-conditioned spatial decoder, losses, and
+no-weight smoke tests. S1 adds frozen multi-token VILA query extraction through
+an inactive-by-default fusion observer and an opt-in adapter. Ordinary VILA
+requests do not import or execute the segmentation package, dense provider, or
+SAM2. The local-only lazy SAM2 image provider and mask refinement boundary have
+now passed a real-checkpoint smoke in the existing `evovila` environment by
+loading an external SAM2 source tree explicitly. The complete opt-in
+VILA+decoder+SAM2 image path has also passed with a local VILA1.5-3B checkpoint,
+including exact ordinary-VILA logit retention before and after the extension
+call. The spatial decoder is still randomly initialized, so this verifies
+    plumbing rather than segmentation quality. S3 now adds a separate opt-in
+    video path that predicts one fixed anchor mask and passes only that predicted
+    mask to a shared-weight SAM2 video predictor. Real A800 smokes passed for
+    both first-frame forward propagation and explicit middle-frame bidirectional
+    propagation, with exact ordinary-VILA logit retention. Model fine-tuning and
+    segmentation-quality claims remain deferred.
+
+```bash
+conda activate /9950backfile/chenjiahui/.conda/envs/evovila
+python -m pytest -q tests/test_evo_seg_*.py
+python scripts/evo_seg/smoke_decoder.py
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_sam2_image.py \
+  --source-root /path/to/local/sam2 \
+  --checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_image_segmentation.py \
+  --vila-model /path/to/local/VILA1.5-3b \
+  --sam2-source-root /path/to/local/sam2 \
+  --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
+  --vila-model /path/to/local/VILA1.5-3b \
+  --sam2-source-root /path/to/local/sam2 \
+  --sam2-checkpoint /path/to/local/sam2.1_hiera_tiny.pt \
+  --device cuda:0
+```
+
+See `docs/implementation.md` for the gated S0-S4 implementation plan and
+`docs/dev_log.md` for verified status.
+
 ## 💡 Introduction
 
 VILA is a family of open VLMs designed to optimize both efficiency and accuracy for efficient video understanding and multi-image understanding. 

@@ -1,0 +1,29 @@
+sam2:
+  source_root: null
+  model_config: configs/sam2.1/sam2.1_hiera_t.yaml
+  checkpoint_path: null
+  device: cuda
+  apply_postprocessing: true
+
+request:
+  enabled: true
+  task: image
+
+input:
+  image_path: null
+  synthetic_height: 96
+  synthetic_width: 128
+
+prompt:
+  query: bright red rectangle
+  instruction_template: "Segment the object described by this referring expression: {query}."
+
+decoder:
+  feature_dim: 256
+  model_dim: 128
+  num_heads: 8
+  num_layers: 2
+  num_object_queries: 1
+  dropout: 0.0
+
+seed: 123

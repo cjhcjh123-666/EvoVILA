@@ -1,0 +1,49 @@
+seed: 0
+task: video
+
+training:
+  steps: 1600
+  lr: 3.0e-4
+  lora_lr: 6.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 25
+  hidden_layer: -1
+  sam2_mask_decoder_trainable: true
+  refined_mask_weight: 0.5
+  fixed_subset: 16
+
+lora:
+  rank: 8
+  alpha: 16
+  layers: 8
+  projections:
+    - self_attn.q_proj
+    - self_attn.v_proj
+
+loss_weights:
+  bce: 1.0
+  dice: 1.0
+  objectness: 0.1
+  temporal: 0.1
+  bce_positive_weight: 5.0
+
+sam2:
+  model_config: configs/sam2.1/sam2.1_hiera_t.yaml
+  apply_postprocessing: true
+
+decoder:
+  feature_dim: 256
+  model_dim: 128
+  num_heads: 8
+  num_layers: 2
+  num_object_queries: 1
+  dropout: 0.0
+
+prompt:
+  instruction_template: "Segment the object described by this referring expression:\n{query}"
+
+retention_probes:
+  image_paths: []
+  video_dir: null
