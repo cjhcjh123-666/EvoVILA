@@ -2,6 +2,8 @@ seed: 0
 
 head: lisa
 
+task: mixed
+
 training:
   steps: 10000
   lr: 2.0e-4
