@@ -46,6 +46,7 @@ from llava.evo_seg.losses import (
     query_swap_margin_loss,
 )
 from llava.evo_seg.sam2_adapter import DenseFeatureBatch, RGBFrameBatch, SAM2ImageFeatureProvider
+from llava.evo_seg.sam2_lisa_head import Sam2LisaHead
 from llava.evo_seg.training import (
     GroundingProjector,
     SegEmbeddingInjector,
@@ -561,16 +562,26 @@ def _run(
     _, sam2_initialization_ms = _timed_call(device, provider.initialize)
     print("[train] SAM2 initialized", flush=True)
 
-    decoder = QueryConditionedSpatialDecoder(
-        query_dim=int(model.llm.config.hidden_size),
-        feature_dim=int(decoder_config.get("feature_dim", 256)),
-        model_dim=int(decoder_config.get("model_dim", 128)),
-        num_heads=int(decoder_config.get("num_heads", 8)),
-        num_layers=int(decoder_config.get("num_layers", 2)),
-        num_object_queries=int(decoder_config.get("num_object_queries", 1)),
-        dropout=float(decoder_config.get("dropout", 0.0)),
-    ).to(device=device)
-    projector = GroundingProjector(hidden_size=int(model.llm.config.hidden_size)).to(device=device)
+    head = str(config.get("head", "query_decoder"))
+    if head == "lisa":
+        decoder = Sam2LisaHead(
+            hidden_size=int(model.llm.config.hidden_size),
+            sam2_model=provider._predictor.model,
+            prompt_dim=int(decoder_config.get("feature_dim", 256)),
+        ).to(device=device, dtype=torch.float32)
+        projector = torch.nn.Identity()  # no projector needed in the LISA path
+        print("[train] head=sam2_lisa ([SEG] state -> SAM2 mask decoder)", flush=True)
+    else:
+        decoder = QueryConditionedSpatialDecoder(
+            query_dim=int(model.llm.config.hidden_size),
+            feature_dim=int(decoder_config.get("feature_dim", 256)),
+            model_dim=int(decoder_config.get("model_dim", 128)),
+            num_heads=int(decoder_config.get("num_heads", 8)),
+            num_layers=int(decoder_config.get("num_layers", 2)),
+            num_object_queries=int(decoder_config.get("num_object_queries", 1)),
+            dropout=float(decoder_config.get("dropout", 0.0)),
+        ).to(device=device)
+        projector = GroundingProjector(hidden_size=int(model.llm.config.hidden_size)).to(device=device)
     seg_injector = SegEmbeddingInjector(embed_module, seg_id, int(model.llm.config.hidden_size))
     seg_injector.seg_embedding = torch.nn.Parameter(seg_injector.seg_embedding.detach().to(device))
     print("[train] trainable components attached", flush=True)
@@ -756,8 +767,29 @@ def _run(
         query_states_raw = query_states.states.to(dtype=torch.float32)
         if not torch.isfinite(query_states_raw).all():
             query_states_raw = torch.nan_to_num(query_states_raw, nan=0.0, posinf=0.0, neginf=0.0)
-        projected = projector(query_states_raw, query_states.mask, seg_positions)
         dense = provider.encode_frames(sample["rgb"])
+        if head == "lisa":
+            seg_state = query_states_raw[
+                torch.arange(query_states_raw.shape[0], device=device), seg_positions
+            ]
+            result = decoder(
+                seg_state,
+                dense.features[:, 0],
+                dense.frame_mask,
+                dense.high_res_features,
+            )
+            batch = GroundingBatch(
+                query_states=seg_state.unsqueeze(1),
+                query_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
+                dense_features=dense.features[:, :1].to(dtype=torch.float32),
+                frame_mask=dense.frame_mask,
+                target_masks=sample["target_mask"] if with_loss else None,
+                target_presence=sample["target_presence"] if with_loss else None,
+                sample_ids=(sample["sample_id"],),
+            )
+            losses = compute_segmentation_loss(result, batch, seg_loss_weights) if with_loss else None
+            return result, losses, batch
+        projected = projector(query_states_raw, query_states.mask, seg_positions)
         dense = _upsample_dense(dense, spatial_scale)
         dense_features = dense.features.to(dtype=torch.float32)
         if not torch.isfinite(dense_features).all():

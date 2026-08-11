@@ -35,6 +35,7 @@ from llava.evo_seg.capability import SegmentationCapability
 from llava.evo_seg.contracts import GroundingBatch
 from llava.evo_seg.decoder import QueryConditionedSpatialDecoder
 from llava.evo_seg.sam2_adapter import SAM2ImageFeatureProvider
+from llava.evo_seg.sam2_lisa_head import Sam2LisaHead
 from llava.evo_seg.sam2_video_adapter import build_sam2_video_image_predictor
 from llava.evo_seg.training import (
     GroundingProjector,
@@ -126,15 +127,23 @@ def main(argv=None) -> int:
     provider.initialize()
 
     decoder = QueryConditionedSpatialDecoder(
-        query_dim=int(model.llm.config.hidden_size),
-        feature_dim=int(decoder_config.get("feature_dim", 256)),
-        model_dim=int(decoder_config.get("model_dim", 128)),
-        num_heads=int(decoder_config.get("num_heads", 8)),
-        num_layers=int(decoder_config.get("num_layers", 2)),
-        num_object_queries=int(decoder_config.get("num_object_queries", 1)),
-        dropout=float(decoder_config.get("dropout", 0.0)),
-    ).to(device=device)
+    query_dim=int(model.llm.config.hidden_size),
+    feature_dim=int(decoder_config.get("feature_dim", 256)),
+    model_dim=int(decoder_config.get("model_dim", 128)),
+    num_heads=int(decoder_config.get("num_heads", 8)),
+    num_layers=int(decoder_config.get("num_layers", 2)),
+    num_object_queries=int(decoder_config.get("num_object_queries", 1)),
+    dropout=float(decoder_config.get("dropout", 0.0)),
+).to(device=device)
     projector = GroundingProjector(int(model.llm.config.hidden_size)).to(device=device)
+    head = str(config.get("head", "query_decoder"))
+    if head == "lisa":
+        decoder = Sam2LisaHead(
+            hidden_size=int(model.llm.config.hidden_size),
+            sam2_model=provider._predictor.model,
+            prompt_dim=int(decoder_config.get("feature_dim", 256)),
+        ).to(device=device, dtype=torch.float32)
+        projector = torch.nn.Identity()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     decoder.load_state_dict(checkpoint["decoder"])
@@ -183,20 +192,27 @@ def main(argv=None) -> int:
             seg_positions = (
                 sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
             ).to(dtype=torch.long, device=device)
-            projected = projector(
-                query_states.states.to(dtype=torch.float32), query_states.mask, seg_positions
-            )
             dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
-            result = capability(
-                GroundingBatch(
-                    query_states=projected,
-                    query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-                    dense_features=dense.features.to(dtype=torch.float32),
-                    frame_mask=dense.frame_mask,
-                    sample_ids=(record["sample_id"],),
-                ),
-                {"enabled": True, "task": "image"},
-            )
+            if head == "lisa":
+                seg_state = query_states.states.to(dtype=torch.float32)[
+                    torch.arange(query_states.states.shape[0], device=device), seg_positions
+                ]
+                result = decoder(seg_state, dense.features[:, 0], dense.frame_mask, dense.high_res_features)
+                projected = seg_state.detach().float().cpu().unsqueeze(1)
+            else:
+                projected = projector(
+                    query_states.states.to(dtype=torch.float32), query_states.mask, seg_positions
+                )
+                result = capability(
+                    GroundingBatch(
+                        query_states=projected,
+                        query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
+                        dense_features=dense.features.to(dtype=torch.float32),
+                        frame_mask=dense.frame_mask,
+                        sample_ids=(record["sample_id"],),
+                    ),
+                    {"enabled": True, "task": "image"},
+                )
         return (
             projected.detach().float().cpu(),
             query_states.states.detach().float().cpu(),

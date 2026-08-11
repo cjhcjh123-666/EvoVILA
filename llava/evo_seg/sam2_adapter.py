@@ -224,6 +224,14 @@ class SAM2ImageFeatureProvider:
         return embedding.detach().clone()
 
     @staticmethod
+    def _extract_high_res_features(predictor: Any) -> List[Tensor]:
+        features = getattr(predictor, "_features", None)
+        levels = features.get("high_res_feats") if isinstance(features, Mapping) else None
+        if not levels:
+            return []
+        return [level.detach().clone() for level in levels if isinstance(level, Tensor)]
+
+    @staticmethod
     def _reset_predictor(predictor: Any) -> None:
         reset = getattr(predictor, "reset_predictor", None)
         if callable(reset):
@@ -242,6 +250,7 @@ class SAM2ImageFeatureProvider:
             try:
                 predictor.set_image_batch(images)
                 valid_features = self._extract_image_embedding(predictor)
+                valid_high_res = self._extract_high_res_features(predictor)
             finally:
                 self._reset_predictor(predictor)
         _synchronize_device(self.options.device)
@@ -253,10 +262,17 @@ class SAM2ImageFeatureProvider:
         features = valid_features.new_zeros((batch_size, frames, *valid_features.shape[1:]))
         for feature_index, (batch_index, frame_index) in enumerate(indices):
             features[batch_index, frame_index] = valid_features[feature_index]
+        high_res_features = []
+        for level_index, level in enumerate(valid_high_res):
+            padded = valid_features.new_zeros((batch_size, frames, *level.shape[1:]))
+            for feature_index, (batch_index, frame_index) in enumerate(indices):
+                padded[batch_index, frame_index] = level[feature_index]
+            high_res_features.append(padded)
         frame_mask = batch.frame_mask.to(device=features.device)
         return DenseFeatureBatch(
             features=features,
             frame_mask=frame_mask,
+            high_res_features=tuple(high_res_features),
             diagnostics={
                 "provider": "sam2_image_encoder",
                 "preprocessing": "SAM2ImagePredictor.set_image_batch",

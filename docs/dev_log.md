@@ -527,3 +527,22 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
   NaN 梯度日志精确到参数名；新增 `--detect-anomaly` 调试开关。
 - **验证**：resume-4000 复现修复前 step 4001 即 NaN，修复后干净跑过 4225+（含 no-object/swap，
   0 NON-FINITE）；eval_s4b / eval_antishortcut bf16 冒烟通过（3 样本，指标与 fp16 一致）。
+
+### 2026-08-11 — 方法审计结论 + LISA 式 head 原型（关键转折）
+
+- **审计结论（数据实锤）**：同图不同 query 的 VILA query-state 余弦，任何层都 ≥0.87
+  （-16 中间层最好 0.868，-1 最后层 0.933，-24 浅层 0.979）；投影后 0.989；mask 同图重叠
+  0.982；swap delta -0.0004。结论：**冻结 VILA 的 query 状态在任何层都不携带可用指代信息，
+  表示必须靠训练学出来，不能靠抽取**。多 token query 也救不了（根源是基座表示塌缩）。
+- **方向选定**：LISA 式改造 —— `[SEG]` token 隐状态 → 投影 256 维 → SAM2 mask decoder 出 mask；
+  保留 VILA 冻结 + LoRA + [SEG] embedding + 反捷径训练（no-object + swap）作为论文卖点。
+- **原型实现（提交）**：`Sam2LisaHead`（sam2_lisa_head.py，SAM mask decoder 参数并入可训练
+  栈）；train_s4b 增加 `head: lisa`；SAM2ImageFeatureProvider 暴露 high_res_features（SAM2
+  tiny 的 mask decoder 需要）；DenseFeatureBatch 增加 high_res_features 字段；audit 工具支持
+  lisa head；`s4b_lisa_overfit.yaml` 配置。
+- **原型结果（800 步 overfit 16 图）**：train IoU **0.941**（旧 decoder T1 overfit 仅 0.585），
+  loss 0.136，4 条 retention 全部精确（max_abs_diff=0.0），800 步 3.5 分钟。query 审计：
+  同图 mask 重叠降到 **0.615**（min 0.0017 —— 部分同图不同 query 已出完全不同 mask），
+  但 swap delta 仍 ~0（本次只训不同图、未训同图 swap）。
+- **下一步**：用反捷径配方（swap 权重拉高 + no-object + 同图 pair）正式训 LISA，再审计
+  swap 灵敏度。

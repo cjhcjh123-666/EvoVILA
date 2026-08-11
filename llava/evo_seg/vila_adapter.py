@@ -33,6 +33,7 @@ class DenseFeatureBatch:
 
     features: Tensor
     frame_mask: Tensor
+    high_res_features: Tuple[Tensor, ...] = ()
     diagnostics: Mapping[str, Any] = MappingProxyType({})
 
     def __post_init__(self) -> None:
@@ -56,6 +57,17 @@ class DenseFeatureBatch:
             raise ValueError("features must have positive spatial dimensions")
         if self.frame_mask.device != self.features.device:
             raise ValueError("features and frame_mask must be on the same device")
+        if not isinstance(self.high_res_features, (tuple, list)):
+            raise TypeError("high_res_features must be a tuple/list of tensors")
+        for level_index, level in enumerate(self.high_res_features):
+            if not isinstance(level, Tensor) or level.ndim != 5:
+                raise ValueError(
+                    f"high_res_features level {level_index} must have shape [B,T,C,H,W]"
+                )
+            if tuple(level.shape[:2]) != tuple(self.features.shape[:2]):
+                raise ValueError(
+                    "high_res_features level must align with features batch/time dims"
+                )
         object.__setattr__(self, "diagnostics", freeze_mapping(self.diagnostics))
 
 
