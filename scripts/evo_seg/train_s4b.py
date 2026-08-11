@@ -781,7 +781,7 @@ def _run(
             batch = GroundingBatch(
                 query_states=seg_state.unsqueeze(1),
                 query_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
-                dense_features=dense.features[:, :1].to(dtype=torch.float32),
+                dense_features=dense.features.to(dtype=torch.float32),
                 frame_mask=dense.frame_mask,
                 target_masks=sample["target_mask"] if with_loss else None,
                 target_presence=sample["target_presence"] if with_loss else None,
