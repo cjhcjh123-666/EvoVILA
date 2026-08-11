@@ -137,8 +137,11 @@ def main() -> None:
     # Configure PS3 and adjust context length
     configure_ps3_and_context_length(model)
 
-    # Set conversation mode
-    clib.default_conversation = clib.conv_templates[args.conv_mode].copy()
+    # ``llava.load`` already selects the legacy template for VILA1.5 models.
+    # Do not replace it with the AUTO template when the CLI default is used;
+    # older checkpoints may not carry a Transformers chat_template.
+    if args.conv_mode != "auto":
+        clib.default_conversation = clib.conv_templates[args.conv_mode].copy()
 
     # Prepare multi-modal prompt
     has_video = False

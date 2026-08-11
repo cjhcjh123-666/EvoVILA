@@ -32,8 +32,7 @@ from einops import rearrange
 from hydra.utils import instantiate
 from transformers import AutoConfig, GenerationConfig, LogitsProcessor, PreTrainedModel
 from transformers.modeling_utils import ContextManagers, no_init_weights
-from llava.constants import MEDIA_TOKENS
-
+from llava.capabilities import CapabilityError, MediaContext, build_capability_pipeline
 from llava.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, MEDIA_TOKENS, NUM_EXTRA_TOKENS
 from llava.conversation import Conversation
 from llava.mm_utils import process_image, process_images
@@ -88,12 +87,147 @@ class LlavaMetaModel(ABC):
                 config = json.loads(config)
             self.encoders[name] = instantiate(config, parent=self)
 
+        # Empty by default. Explicit capabilities observe requests but cannot
+        # replace VILA's media embeddings or token-alignment logic.
+        self.capabilities = build_capability_pipeline(config=self.config)
+        self.capability_modules = torch.nn.ModuleList(
+            [capability for capability in self.capabilities.capabilities if isinstance(capability, torch.nn.Module)]
+        )
+        self._active_capability_context = None
+        self._load_capability_checkpoint()
+
         self.post_config()
         self.is_loaded = True
 
         assert (
             self.llm is not None or self.vision_tower is not None or self.mm_projector is not None
         ), "At least one of the components must be instantiated."
+
+    def _notify_capabilities(
+        self,
+        input_ids,
+        media,
+        media_config,
+        *,
+        stage: str = "embed",
+        metadata=None,
+    ):
+        pipeline = getattr(self, "capabilities", None)
+        if pipeline is None:
+            return ()
+        context = MediaContext.from_inputs(
+            input_ids,
+            media,
+            media_config,
+            stage=stage,
+            training=self.training,
+            metadata=metadata,
+        )
+        self._active_capability_context = context
+        return pipeline.on_media_context(context)
+
+    def _notify_capability_vision_features(self, features, media_name: str = "image"):
+        pipeline = getattr(self, "capabilities", None)
+        context = getattr(self, "_active_capability_context", None)
+        if pipeline is None or context is None:
+            return ()
+        return pipeline.on_vision_features(context, features, media_name=media_name)
+
+    def _load_capability_checkpoint(self) -> None:
+        if len(getattr(self, "capability_modules", ())) == 0:
+            return
+        resume_path = getattr(self.config, "resume_path", None) or getattr(self.config, "_name_or_path", None)
+        checkpoint_name = getattr(self.config, "capability_checkpoint", None)
+        if resume_path is None or checkpoint_name is None:
+            return
+        checkpoint_path = checkpoint_name
+        if not osp.isabs(checkpoint_path):
+            checkpoint_path = osp.join(resume_path, checkpoint_path)
+        if not osp.isfile(checkpoint_path):
+            return
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        self.load_state_dict(state_dict, strict=False)
+
+    def _finalize_capabilities(self, outputs):
+        pipeline = getattr(self, "capabilities", None)
+        if pipeline is None:
+            return outputs
+
+        capability_outputs = pipeline.get_outputs()
+        capability_loss = pipeline.compute_loss()
+        if isinstance(outputs, dict):
+            outputs.update(capability_outputs)
+            if capability_loss is not None:
+                outputs["loss"] = capability_loss if outputs.get("loss") is None else outputs["loss"] + capability_loss
+        elif not isinstance(outputs, tuple):
+            for name, value in capability_outputs.items():
+                setattr(outputs, name, value)
+            if capability_loss is not None:
+                outputs.loss = capability_loss if outputs.loss is None else outputs.loss + capability_loss
+        self._active_capability_context = None
+        pipeline.clear()
+        return outputs
+
+    def _clear_capability_request(self) -> None:
+        pipeline = getattr(self, "capabilities", None)
+        if pipeline is not None:
+            pipeline.clear()
+        self._active_capability_context = None
+
+    @torch.inference_mode()
+    def segment_images(
+        self,
+        images: torch.Tensor,
+        *,
+        input_ids: Optional[torch.Tensor] = None,
+        media_config: Optional[Dict[str, Dict[str, Any]]] = None,
+        segmentation_masks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the explicitly enabled image mask branch without an LLM call."""
+        if "image_segmentation" not in getattr(self.capabilities, "enabled_names", ()):
+            raise CapabilityError("segment_images requires capabilities=['image_segmentation']")
+        if not isinstance(images, torch.Tensor) or images.dim() not in (3, 4):
+            raise ValueError("images must be shaped [channels, height, width] or [batch, channels, height, width]")
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        media_config = media_config or {"image": {}}
+        media = {"image": [image for image in images]}
+        self._notify_capabilities(
+            input_ids,
+            media,
+            media_config,
+            stage="segment",
+            metadata={"segmentation_masks": segmentation_masks},
+        )
+        try:
+            self.encode_images(images, block_sizes=media_config.get("image", {}).get("block_sizes"))
+            outputs = self.capabilities.get_outputs()
+        finally:
+            self._clear_capability_request()
+        if "mask_logits" not in outputs:
+            raise CapabilityError("image_segmentation produced no mask logits")
+        return outputs["mask_logits"]
+
+    @torch.inference_mode()
+    def segment_videos(self, video, *, return_result: bool = False, **kwargs):
+        """Run the explicitly enabled SAM2 video branch without an LLM call."""
+        pipeline = getattr(self, "capabilities", None)
+        capability = next(
+            (
+                candidate
+                for candidate in getattr(pipeline, "capabilities", ())
+                if getattr(candidate, "name", None) == "video_segmentation"
+            ),
+            None,
+        )
+        if capability is None or not hasattr(capability, "segment"):
+            raise CapabilityError("segment_videos requires capabilities=['video_segmentation']")
+        try:
+            return capability.segment(video, return_result=return_result, **kwargs)
+        finally:
+            self._clear_capability_request()
 
     @classmethod
     def load_from_config(cls, model_path_or_config, *args, **kwargs):
@@ -199,6 +333,14 @@ class LlavaMetaModel(ABC):
                 state_dict=mm_projector_state_dict,
             )
             self.config.mm_projector_cfg = self.mm_projector.config
+
+        capability_state_dict = OrderedDict(
+            (key, value) for key, value in state_dict.items() if key.startswith("capability_modules.")
+        )
+        if capability_state_dict:
+            capability_path = osp.join(output_dir, "capabilities.bin")
+            torch.save(capability_state_dict, capability_path)
+            self.config.capability_checkpoint = "capabilities.bin"
         ## update and save top-level config
         self.config._name_or_path = output_dir
         self.config.architectures = [self.__class__.__name__]
@@ -392,6 +534,7 @@ class LlavaMetaModel(ABC):
         else:
             image_features = self.get_vision_tower()(images)
             image_features = self.get_mm_projector()(image_features)
+        self._notify_capability_vision_features(image_features, media_name="image")
         return image_features
 
     ## @yunhao: is there a better way to handle function call and attributes for llm?
@@ -417,6 +560,7 @@ class LlavaMetaForCausalLM(ABC):
         media_config: Dict[str, Dict[str, Any]],
         labels: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        capability_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fusion_observer = current_fusion_observer()
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
@@ -866,7 +1010,10 @@ class LlavaMetaForCausalLM(ABC):
         **generation_kwargs,
     ):
         inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
-        return self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        try:
+            return self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        finally:
+            self._clear_capability_request()
 
     @torch.inference_mode()
     def generate_content(
@@ -1371,6 +1518,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         num_look_close=None,
         gt_selection_maps=None,
         original_image_sizes=None,
+        capability_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fusion_observer = current_fusion_observer()
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
@@ -1747,7 +1895,10 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         else:
             inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
 
-        outputs = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        try:
+            outputs = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        finally:
+            self._clear_capability_request()
 
         if return_selection_probs:
             return outputs, top_down_selection_maps, top_down_selection_probs

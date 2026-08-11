@@ -41,6 +41,7 @@ from transformers.modeling_utils import ContextManagers, no_init_weights
 from .auto_processor import VILAProcessor
 from .base_projector import MultimodalProjector, MultimodalProjectorConfig
 from .builder import build_llm_and_tokenizer
+from .capabilities import CapabilityError, MediaContext, build_capability_pipeline
 from .configuration_vila import VILAConfig
 from .constants import *
 from .conversation import SeparatorStyle, default_conversation
@@ -217,6 +218,12 @@ class VILAPretrainedModel(PreTrainedModel):
         self.tokenizer.padding_side = "left"
         # TODO(ligeng): need to add other decoders from config
         self.encoders = {"image": BasicImageEncoder(self), "video": BasicVideoEncoder(self)}
+        self.capabilities = build_capability_pipeline(config=self.config)
+        self.capability_modules = nn.ModuleList(
+            [capability for capability in self.capabilities.capabilities if isinstance(capability, nn.Module)]
+        )
+        self._active_capability_context = None
+        self._load_capability_checkpoint()
 
         self.post_config()
         self.is_loaded = True
@@ -224,6 +231,103 @@ class VILAPretrainedModel(PreTrainedModel):
         assert (
             self.llm is not None or self.vision_tower is not None or self.mm_projector is not None
         ), "At least one of the components must be instantiated."
+
+    def _notify_capabilities(self, input_ids, media, media_config, *, stage="embed", metadata=None):
+        context = MediaContext.from_inputs(
+            input_ids,
+            media,
+            media_config,
+            stage=stage,
+            training=self.training,
+            metadata=metadata,
+        )
+        self._active_capability_context = context
+        return self.capabilities.on_media_context(context)
+
+    def _notify_capability_vision_features(self, features, media_name="image"):
+        context = getattr(self, "_active_capability_context", None)
+        if context is None:
+            return ()
+        return self.capabilities.on_vision_features(context, features, media_name=media_name)
+
+    def _load_capability_checkpoint(self):
+        if len(self.capability_modules) == 0:
+            return
+        checkpoint_name = getattr(self.config, "capability_checkpoint", None)
+        resume_path = getattr(self.config, "resume_path", None) or getattr(self.config, "_name_or_path", None)
+        if checkpoint_name is None or resume_path is None:
+            return
+        checkpoint_path = checkpoint_name if osp.isabs(checkpoint_name) else osp.join(resume_path, checkpoint_name)
+        if not osp.isfile(checkpoint_path):
+            return
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        self.load_state_dict(state_dict, strict=False)
+
+    def _finalize_capabilities(self, outputs):
+        capability_outputs = self.capabilities.get_outputs()
+        capability_loss = self.capabilities.compute_loss()
+        if isinstance(outputs, dict):
+            outputs.update(capability_outputs)
+            if capability_loss is not None:
+                outputs["loss"] = capability_loss if outputs.get("loss") is None else outputs["loss"] + capability_loss
+        elif not isinstance(outputs, tuple):
+            for name, value in capability_outputs.items():
+                setattr(outputs, name, value)
+            if capability_loss is not None:
+                outputs.loss = capability_loss if outputs.loss is None else outputs.loss + capability_loss
+        self._active_capability_context = None
+        self.capabilities.clear()
+        return outputs
+
+    def _clear_capability_request(self):
+        self.capabilities.clear()
+        self._active_capability_context = None
+
+    @torch.inference_mode()
+    def segment_images(self, images, *, input_ids=None, media_config=None, segmentation_masks=None):
+        if "image_segmentation" not in getattr(self.capabilities, "enabled_names", ()):
+            raise CapabilityError("segment_images requires capabilities=['image_segmentation']")
+        if not isinstance(images, torch.Tensor) or images.dim() not in (3, 4):
+            raise ValueError("images must be shaped [channels, height, width] or [batch, channels, height, width]")
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        media_config = media_config or {"image": {}}
+        media = {"image": [image for image in images]}
+        self._notify_capabilities(
+            input_ids,
+            media,
+            media_config,
+            stage="segment",
+            metadata={"segmentation_masks": segmentation_masks},
+        )
+        try:
+            self.encode_images(images, block_sizes=media_config.get("image", {}).get("block_sizes"))
+            outputs = self.capabilities.get_outputs()
+        finally:
+            self._clear_capability_request()
+        if "mask_logits" not in outputs:
+            raise CapabilityError("image_segmentation produced no mask logits")
+        return outputs["mask_logits"]
+
+    @torch.inference_mode()
+    def segment_videos(self, video, *, return_result: bool = False, **kwargs):
+        """Run the explicitly enabled SAM2 video branch without an LLM call."""
+        capability = next(
+            (
+                candidate
+                for candidate in getattr(self.capabilities, "capabilities", ())
+                if getattr(candidate, "name", None) == "video_segmentation"
+            ),
+            None,
+        )
+        if capability is None or not hasattr(capability, "segment"):
+            raise CapabilityError("segment_videos requires capabilities=['video_segmentation']")
+        try:
+            return capability.segment(video, return_result=return_result, **kwargs)
+        finally:
+            self._clear_capability_request()
 
     @classmethod
     def convert_vila_dev_ckpt_to_remote(
@@ -397,6 +501,13 @@ class VILAPretrainedModel(PreTrainedModel):
                 state_dict=mm_projector_state_dict,
             )
             self.config.mm_projector_cfg = self.mm_projector.config
+
+        capability_state_dict = OrderedDict(
+            (key, value) for key, value in state_dict.items() if key.startswith("capability_modules.")
+        )
+        if capability_state_dict:
+            torch.save(capability_state_dict, osp.join(output_dir, "capabilities.bin"))
+            self.config.capability_checkpoint = "capabilities.bin"
 
         ## update and save top-level config
         self.config._name_or_path = output_dir
@@ -601,6 +712,7 @@ class VILAForCausalLM(VILAPretrainedModel):
         else:
             image_features = self.get_vision_tower()(images)
             image_features = self.get_mm_projector()(image_features)
+        self._notify_capability_vision_features(image_features, media_name="image")
         return image_features
 
     def train(self, mode: bool = True):
@@ -614,10 +726,12 @@ class VILAForCausalLM(VILAPretrainedModel):
         media_config: Dict[str, Dict[str, Any]],
         labels: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        capability_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE(ligeng): deep copy to avoid modifying the original media and media_config
         media = copy.deepcopy(media)
         media_config = copy.deepcopy(media_config)
+        self._notify_capabilities(input_ids, media, media_config, metadata=capability_inputs)
 
         labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
         attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
@@ -1037,6 +1151,7 @@ class VILAForCausalLM(VILAPretrainedModel):
         force_packing: bool = False,
         seqlens_in_batch: Optional[torch.LongTensor] = None,
         dpo_forward: bool = False,
+        segmentation_masks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         self.freezed_module_patch()
@@ -1051,7 +1166,14 @@ class VILAForCausalLM(VILAPretrainedModel):
             media_config = defaultdict(dict)
 
         if inputs_embeds is None:
-            inputs_embeds, labels, attention_mask = self._embed(input_ids, media, media_config, labels, attention_mask)
+            inputs_embeds, labels, attention_mask = self._embed(
+                input_ids,
+                media,
+                media_config,
+                labels,
+                attention_mask,
+                capability_inputs={"segmentation_masks": segmentation_masks},
+            )
 
         if force_packing or (packing and self.training and not dpo_forward):
             if seqlens_in_batch is None:
@@ -1078,6 +1200,8 @@ class VILAForCausalLM(VILAPretrainedModel):
                 soft_tokens=self.config.time_token_ids,
                 std=self.config.soft_ce_std,
             )
+
+        outputs = self._finalize_capabilities(outputs)
 
         if dpo_forward:
             return outputs.logits, labels
@@ -1108,7 +1232,10 @@ class VILAForCausalLM(VILAPretrainedModel):
         # if attention_mask is not None:
         #     attention_mask = attention_mask.cuda()
         inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
-        output_ids = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        try:
+            output_ids = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+        finally:
+            self._clear_capability_request()
 
         if return_output_ids_only:
             return_value = output_ids

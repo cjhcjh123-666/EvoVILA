@@ -17,14 +17,17 @@ fi
 # This is required to enable PEP 660 support
 pip install --upgrade pip setuptools
 
-# Install FlashAttention2
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.8/flash_attn-2.5.8+cu122torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+# Install the CUDA 12.1-compatible PyTorch stack used by VILA and PS3.
+pip install torch==2.4.1 torchvision==0.19.1
+
+# Install FlashAttention2 built for the PyTorch 2.4 ABI.
+pip install --no-deps https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
 # Install VILA
 pip install -e ".[train,eval]"
 
-# Quantization requires the newest triton version, and introduce dependency issue
-pip install triton==3.1.0
+# VILA FP8 kernels use libdevice, which is available in Triton 3.0.0.
+pip install triton==3.0.0
 
 # numpy introduce a lot dependencies issues, separate from pyproject.yaml
 # pip install numpy==1.26.4

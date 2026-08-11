@@ -21,7 +21,38 @@ class DataCollator:
     def __call__(self, instances: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         # Gather everything from the batch
         input_ids, labels, media, block_sizes = [], [], {name: [] for name in self.tokenizer.media_tokens}, []
+        segmentation_masks = []
+        has_segmentation_masks = [instance.get("segmentation_masks") is not None for instance in instances]
+        if any(has_segmentation_masks) and not all(has_segmentation_masks):
+            raise ValueError("A batch cannot mix segmentation and non-segmentation instances")
+
+        def normalize_segmentation_masks(value: Any) -> torch.Tensor:
+            if isinstance(value, (list, tuple)):
+                value = torch.stack(list(value), dim=0)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("segmentation_masks must be a tensor or a sequence of tensors")
+            if value.dim() == 2:
+                value = value.unsqueeze(0)
+            if value.dim() == 4 and value.shape[1] == 1:
+                value = value[:, 0]
+            if value.dim() != 3:
+                raise ValueError("segmentation_masks must be shaped [num_images, height, width]")
+            return value
+
         for instance in instances:
+            if instance.get("segmentation_masks") is not None:
+                masks = normalize_segmentation_masks(instance["segmentation_masks"])
+                images = instance.get("image") or []
+                if isinstance(instance["input_ids"], torch.Tensor):
+                    image_count = len(images)
+                else:
+                    image_count = sum(len(sample_images or []) for sample_images in images)
+                if masks.shape[0] != image_count:
+                    raise ValueError(
+                        "segmentation_masks count must match the number of images "
+                        f"in the instance ({masks.shape[0]} != {image_count})"
+                    )
+                segmentation_masks.append(masks)
             if isinstance(instance["input_ids"], torch.Tensor):
                 input_ids.append(instance["input_ids"])
                 labels.append(instance["labels"])
@@ -146,7 +177,7 @@ class DataCollator:
         else:
             gt_selection_maps = None
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "media": media,
             "media_config": {
@@ -157,3 +188,8 @@ class DataCollator:
             "attention_mask": attention_mask,
             "gt_selection_maps": gt_selection_maps,
         }
+        if segmentation_masks:
+            if len({tuple(masks.shape[1:]) for masks in segmentation_masks}) != 1:
+                raise ValueError("All segmentation masks in a batch must have the same height and width")
+            batch["segmentation_masks"] = torch.cat(segmentation_masks, dim=0)
+        return batch
