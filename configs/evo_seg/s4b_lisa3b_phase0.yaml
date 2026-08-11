@@ -12,7 +12,7 @@ head: lisa
 task: mixed
 
 training:
-  steps: 20000
+  steps: 40000
   lr: 2.0e-4
   lora_lr: 4.0e-4
   weight_decay: 0.0
