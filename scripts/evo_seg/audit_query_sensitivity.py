@@ -74,6 +74,11 @@ def main(argv=None) -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-pairs", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--hidden-layers",
+        default="-1,-16,-24",
+        help="comma-separated hidden-layer indices to scan for query-state discrimination",
+    )
     args = parser.parse_args(argv)
 
     config = _load_config(args.config.expanduser().resolve())
@@ -164,7 +169,7 @@ def main(argv=None) -> int:
     if not pairs:
         raise SystemExit("no swap pairs found; pass --pairs-file with same-image pairs")
 
-    def forward_record(record: Dict):
+    def forward_record(record: Dict, hidden_layer_idx: int):
         sample = _image_sample(record, model, tokenizer, template, seg_id, device)
         with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             query_states = adapter.extract_query_states_training(
@@ -173,7 +178,7 @@ def main(argv=None) -> int:
                 sample["media_config"],
                 sample["query_mask"],
                 sample["attention_mask"],
-                hidden_layer=hidden_layer,
+                hidden_layer=hidden_layer_idx,
             )
             seg_positions = (
                 sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
@@ -199,8 +204,9 @@ def main(argv=None) -> int:
             sample["target_mask"][0, 0, 0].detach().cpu(),
         )
 
-    same_cos, cross_cos = [], []
-    raw_cos = []
+    hidden_layers = [int(x) for x in args.hidden_layers.split(",") if x.strip()]
+    raw_cos_by_layer = {h: [] for h in hidden_layers}
+    projected_cos = []
     same_mask_overlap, swapped_mask_overlap = [], []
     pair_records = []
     for pair in pairs:
@@ -211,8 +217,15 @@ def main(argv=None) -> int:
         if left is None or right is None or left.get("media_id") != right.get("media_id"):
             continue
         try:
-            qa, raw_a, mask_a, gt_a = forward_record(left)
-            qb, raw_b, mask_b, gt_b = forward_record(right)
+            qa, raw_a, mask_a, gt_a = forward_record(left, hidden_layers[0])
+            qb, raw_b, mask_b, gt_b = forward_record(right, hidden_layers[0])
+            layer_raw = {}
+            for h in hidden_layers:
+                _, raw_ha, _, _ = forward_record(left, h)
+                _, raw_hb, _, _ = forward_record(right, h)
+                ra = raw_ha.mean(dim=1).squeeze(0)
+                rb = raw_hb.mean(dim=1).squeeze(0)
+                layer_raw[h] = float(F.cosine_similarity(ra[None], rb[None]).item())
         except Exception as error:  # noqa: BLE001
             print(f"pair {left_id}/{right_id} failed: {error}", flush=True)
             continue
@@ -220,11 +233,9 @@ def main(argv=None) -> int:
         # query-state cosine similarity
         va = qa.mean(dim=1).squeeze(0)
         vb = qb.mean(dim=1).squeeze(0)
-        same_cos.append(float(F.cosine_similarity(va[None], vb[None]).item()))
-        # raw VILA query-state cosine (before the projector)
-        ra = raw_a.mean(dim=1).squeeze(0)
-        rb = raw_b.mean(dim=1).squeeze(0)
-        raw_cos.append(float(F.cosine_similarity(ra[None], rb[None]).item()))
+        projected_cos.append(float(F.cosine_similarity(va[None], vb[None]).item()))
+        for h, value in layer_raw.items():
+            raw_cos_by_layer[h].append(value)
         # same-image mask overlap (a's mask vs b's mask)
         sa = (mask_a[0, 0, 0].sigmoid() > 0.5)
         sb = (mask_b[0, 0, 0].sigmoid() > 0.5)
@@ -250,8 +261,10 @@ def main(argv=None) -> int:
 
     report = {
         "query_state_cosine": {
-            "same_image_different_query": summary(same_cos),
-            "raw_vila_states_before_projector": summary(raw_cos),
+            "projected_after_projector": summary(projected_cos),
+            "raw_vila_states_by_layer": {
+                str(h): summary(values) for h, values in raw_cos_by_layer.items()
+            },
             "interpretation": (
                 "near 1.0 => query representation collapses (image-prior); "
                 "low => queries are discriminative"
