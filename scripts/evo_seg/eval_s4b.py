@@ -34,6 +34,7 @@ from llava.evo_seg.capability import SegmentationCapability
 from llava.evo_seg.contracts import GroundingBatch
 from llava.evo_seg.decoder import QueryConditionedSpatialDecoder
 from llava.evo_seg.sam2_adapter import RGBFrameBatch, SAM2ImageFeatureProvider
+from llava.evo_seg.sam2_lisa_head import Sam2LisaHead
 from llava.evo_seg.sam2_video_adapter import (
     SAM2VideoMaskPropagator,
     build_sam2_video_image_predictor,
@@ -109,10 +110,12 @@ def _eval_image_record(
     device: torch.device,
     adapter: VILASegmentationAdapter,
     capability: SegmentationCapability,
-    projector: GroundingProjector,
+    projector: Any,
     provider: SAM2ImageFeatureProvider,
+    decoder: Any,
     hidden_layer: int,
     spatial_scale: int,
+    head: str,
 ) -> Dict[str, Any]:
     sample = _image_sample(record, model, tokenizer, template, seg_id, device)
     with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -123,19 +126,27 @@ def _eval_image_record(
         seg_positions = (
             sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
         ).to(dtype=torch.long, device=device)
-        projected = projector(query_states.states, query_states.mask, seg_positions)
-        dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
-        result = capability(
-            GroundingBatch(
-                query_states=projected,
-                query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-                dense_features=dense.features,
-                frame_mask=dense.frame_mask,
-                sample_ids=(record["sample_id"],),
-            ),
-            {"enabled": True, "task": "image"},
-        )
-        refined = _sam2_refine_trainable(provider, sample["rgb"], result.mask_logits, device)
+        if head == "lisa":
+            seg_state = query_states.states.to(dtype=torch.float32)
+            seg_state = torch.nan_to_num(seg_state, nan=0.0, posinf=0.0, neginf=0.0)
+            seg_state = seg_state[torch.arange(seg_state.shape[0], device=device), seg_positions]
+            dense = provider.encode_frames(sample["rgb"])
+            result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
+            refined = result.mask_logits.detach()
+        else:
+            projected = projector(query_states.states, query_states.mask, seg_positions)
+            dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
+            result = capability(
+                GroundingBatch(
+                    query_states=projected,
+                    query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
+                    dense_features=dense.features,
+                    frame_mask=dense.frame_mask,
+                    sample_ids=(record["sample_id"],),
+                ),
+                {"enabled": True, "task": "image"},
+            )
+            refined = _sam2_refine_trainable(provider, sample["rgb"], result.mask_logits, device)
     target = sample["target_mask"][0, 0, 0].detach()
     coarse_iou = _mask_iou(result.mask_logits[0, 0, 0].detach(), target)
     refined_iou = _mask_iou(refined[0, 0, 0].detach(), target)
@@ -157,10 +168,12 @@ def _eval_video_record(
     device: torch.device,
     adapter: VILASegmentationAdapter,
     capability: SegmentationCapability,
-    projector: GroundingProjector,
+    projector: Any,
     provider: SAM2ImageFeatureProvider,
     propagator: SAM2VideoMaskPropagator,
+    decoder: Any,
     hidden_layer: int,
+    head: str,
 ) -> Dict[str, Any]:
     sample = _video_sample(record, model, tokenizer, template, seg_id, device)
     with torch.no_grad(), seg_training_active(True), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -171,26 +184,33 @@ def _eval_video_record(
         seg_positions = (
             sample["query_mask"][:, : sample["seg_position"] + 1].sum(dim=1) - 1
         ).to(dtype=torch.long, device=device)
-        projected = projector(query_states.states, query_states.mask, seg_positions)
         dense = provider.encode_frames(sample["rgb"])
-        result = capability(
-            GroundingBatch(
-                query_states=projected,
-                query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
-                dense_features=dense.features,
-                frame_mask=dense.frame_mask,
+        if head == "lisa":
+            seg_state = query_states.states.to(dtype=torch.float32)
+            seg_state = torch.nan_to_num(seg_state, nan=0.0, posinf=0.0, neginf=0.0)
+            seg_state = seg_state[torch.arange(seg_state.shape[0], device=device), seg_positions]
+            result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
+            refined_anchor = result.mask_logits[:, :, :1][0, :, 0]  # [N,H,W]
+        else:
+            projected = projector(query_states.states, query_states.mask, seg_positions)
+            result = capability(
+                GroundingBatch(
+                    query_states=projected,
+                    query_mask=torch.ones(1, projected.shape[1], dtype=torch.bool, device=device),
+                    dense_features=dense.features,
+                    frame_mask=dense.frame_mask,
+                    sample_ids=(record["sample_id"],),
+                ),
+                {"enabled": True, "task": "video"},
+            )
+            anchor_rgb = RGBFrameBatch(
+                frames=sample["rgb"].frames[:, :1],
+                frame_mask=torch.ones(1, 1, dtype=torch.bool),
                 sample_ids=(record["sample_id"],),
-            ),
-            {"enabled": True, "task": "video"},
-        )
-        anchor_rgb = RGBFrameBatch(
-            frames=sample["rgb"].frames[:, :1],
-            frame_mask=torch.ones(1, 1, dtype=torch.bool),
-            sample_ids=(record["sample_id"],),
-        )
-        refined_anchor = _sam2_refine_trainable(
-            provider, anchor_rgb, result.mask_logits[:, :, :1], device
-        )[0, :, 0]  # [N,H,W] at frame resolution
+            )
+            refined_anchor = _sam2_refine_trainable(
+                provider, anchor_rgb, result.mask_logits[:, :, :1], device
+            )[0, :, 0]  # [N,H,W] at frame resolution
 
     media_dir = Path(record["media_path"])
     frame_paths = sorted(media_dir.glob("*.jpg"))
@@ -376,20 +396,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     propagator = SAM2VideoMaskPropagator(provider)
     propagator.initialize()
 
-    decoder = QueryConditionedSpatialDecoder(
-        query_dim=int(model.llm.config.hidden_size),
-        feature_dim=int(decoder_config.get("feature_dim", 256)),
-        model_dim=int(decoder_config.get("model_dim", 128)),
-        num_heads=int(decoder_config.get("num_heads", 8)),
-        num_layers=int(decoder_config.get("num_layers", 2)),
-        num_object_queries=int(decoder_config.get("num_object_queries", 1)),
-        dropout=float(decoder_config.get("dropout", 0.0)),
-    ).to(device=device)
-    projector = GroundingProjector(int(model.llm.config.hidden_size)).to(device=device)
+    head = str(config.get("head", "query_decoder"))
+    if head == "lisa":
+        decoder = Sam2LisaHead(
+            hidden_size=int(model.llm.config.hidden_size),
+            sam2_model=provider._predictor.model,
+            prompt_dim=int(decoder_config.get("feature_dim", 256)),
+        ).to(device=device)
+        projector = torch.nn.Identity()
+    else:
+        decoder = QueryConditionedSpatialDecoder(
+            query_dim=int(model.llm.config.hidden_size),
+            feature_dim=int(decoder_config.get("feature_dim", 256)),
+            model_dim=int(decoder_config.get("model_dim", 128)),
+            num_heads=int(decoder_config.get("num_heads", 8)),
+            num_layers=int(decoder_config.get("num_layers", 2)),
+            num_object_queries=int(decoder_config.get("num_object_queries", 1)),
+            dropout=float(decoder_config.get("dropout", 0.0)),
+        ).to(device=device)
+        projector = GroundingProjector(int(model.llm.config.hidden_size)).to(device=device)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     decoder.load_state_dict(checkpoint["decoder"])
-    projector.load_state_dict(checkpoint["projector"])
+    if head != "lisa":
+        projector.load_state_dict(checkpoint["projector"])
     seg_injector.seg_embedding.data.copy_(checkpoint["seg_embedding"].to(device))
     lora = dict(config.get("lora", {}))
     llm = model.get_llm()
@@ -427,7 +457,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             result = _eval_image_record(
                 record, model, tokenizer, template, seg_id, device,
-                adapter, capability, projector, provider, hidden_layer, spatial_scale,
+                adapter, capability, projector, provider, decoder,
+                hidden_layer, spatial_scale, head,
             )
         except Exception as error:  # noqa: BLE001
             result = {"sample_id": record["sample_id"], "error": str(error)}
@@ -447,7 +478,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 result = _eval_video_record(
                     record, model, tokenizer, template, seg_id, device,
-                    adapter, capability, projector, provider, propagator, hidden_layer,
+                    adapter, capability, projector, provider, propagator, decoder,
+                    hidden_layer, head,
                 )
             except Exception as error:  # noqa: BLE001
                 result = {"sample_id": record["sample_id"], "error": str(error)}
