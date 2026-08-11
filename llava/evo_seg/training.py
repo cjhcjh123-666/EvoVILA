@@ -70,27 +70,44 @@ def _layer_projection(layer: nn.Module, name: str) -> nn.Linear:
 def apply_lora(
     layers: Sequence[nn.Module],
     projection_names: Sequence[str],
-    rank: int,
-    alpha: float,
+    rank: Optional[int] = None,
+    alpha: Optional[float] = None,
+    key_prefix: str = "",
 ) -> Tuple[Dict[str, List[LoRAAdapter]], List[Any]]:
     """Attach additive LoRA adapters to named projections of every layer.
 
     The base weights stay frozen and unmodified; adapters only contribute when
     :func:`seg_training_active` is enabled.  Returns adapters by projection
     name and the forward-hook handles used to remove them later.
+
+    If ``rank`` is None the adapter is full-rank (rank == in_features), i.e. a
+    seg-scoped full fine-tune of the target projection with the same gated
+    add-on structure; ``alpha`` defaults to the rank (scaling 1).  ``key_prefix``
+    lets callers attach adapters to multiple module families (e.g. the LLM and
+    the vision tower) without colliding on the returned adapter keys.
     """
 
     if not layers or not projection_names:
         raise ValueError("LoRA requires at least one layer and projection")
-    adapters: Dict[str, List[LoRAAdapter]] = {name: [] for name in projection_names}
+    keys = [f"{key_prefix}{name}" for name in projection_names]
+    adapters: Dict[str, List[LoRAAdapter]] = {key: [] for key in keys}
     handles: List[Any] = []
     for layer in layers:
         for name in projection_names:
-            linear = _layer_projection(layer, name)
+            try:
+                linear = _layer_projection(layer, name)
+            except (AttributeError, TypeError):
+                print(
+                    f"[lora] WARNING projection '{name}' not found on {type(layer).__name__}; skipping",
+                    flush=True,
+                )
+                continue
+            effective_rank = linear.in_features if rank is None else int(rank)
+            effective_alpha = float(effective_rank) if alpha is None else float(alpha)
             adapter = LoRAAdapter(
-                linear.in_features, linear.out_features, rank, alpha
+                linear.in_features, linear.out_features, effective_rank, effective_alpha
             ).to(device=linear.weight.device, dtype=torch.float32)
-            adapters[name].append(adapter)
+            adapters[f"{key_prefix}{name}"].append(adapter)
 
             def make_hook(adapter: LoRAAdapter):
                 def hook(_module: nn.Module, args: Tuple[Any, ...], output: Tensor) -> Tensor:

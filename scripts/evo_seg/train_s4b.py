@@ -623,13 +623,35 @@ def _run(
 
     llm = model.get_llm()
     llm_layers = getattr(getattr(llm, "model", llm), "layers")
-    lora_layers = list(llm_layers[-int(lora.get("layers", 8)) :])
+    full_rank = bool(lora.get("full_rank", False))
+    lora_rank = None if full_rank else int(lora.get("rank", 8))
+    lora_alpha = None if full_rank else float(lora.get("alpha", 16))
+    lora_layers_n = int(lora.get("layers", 8))
+    lora_proj = list(lora.get("projections", ["self_attn.q_proj", "self_attn.v_proj"]))
+    lora_layers = list(llm_layers[-lora_layers_n:])
     lora_adapters, lora_handles = apply_lora(
-        lora_layers,
-        list(lora.get("projections", ["self_attn.q_proj", "self_attn.v_proj"])),
-        int(lora.get("rank", 8)),
-        float(lora.get("alpha", 16)),
+        lora_layers, lora_proj, lora_rank, lora_alpha
     )
+    if bool(lora.get("vision_lora", False)):
+        vision_model = model.vision_tower.vision_tower.vision_model
+        vision_layers = list(vision_model.encoder.layers)
+        v_rank = None if full_rank else int(lora.get("vision_rank", 16))
+        v_alpha = None if full_rank else float(lora.get("vision_alpha", 32))
+        v_adapters, v_handles = apply_lora(
+            vision_layers,
+            ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"],
+            v_rank,
+            v_alpha,
+            key_prefix="vision_",
+        )
+        for key, adapters_list in v_adapters.items():
+            lora_adapters.setdefault(key, []).extend(adapters_list)
+        lora_handles.extend(v_handles)
+        print(
+            f"[train] vision-tower LoRA attached on {len(vision_layers)} layers "
+            f"(rank={'full' if full_rank else v_rank})",
+            flush=True,
+        )
 
     sam2_mask_decoder_trainable = bool(training.get("sam2_mask_decoder_trainable", False))
     sam2_mask_decoder_params: List[torch.nn.Parameter] = []
@@ -670,9 +692,12 @@ def _run(
         projector.load_state_dict(state["projector"])
         with torch.no_grad():
             seg_injector.seg_embedding.copy_(state["seg_embedding"].to(device))
+        saved_lora = state.get("lora", {})
         for name, adapters in lora_adapters.items():
+            if name not in saved_lora:
+                continue
             for index, lora_adapter in enumerate(adapters):
-                lora_adapter.load_state_dict(state["lora"][name][index])
+                lora_adapter.load_state_dict(saved_lora[name][index])
         if sam2_mask_decoder_trainable and state.get("sam2_mask_decoder"):
             with torch.no_grad():
                 for name, parameter in provider._predictor.model.sam_mask_decoder.named_parameters():
@@ -719,9 +744,12 @@ def _run(
     if mixed and int(training.get("fixed_subset", 0)) > 0:
         raise ValueError("mixed training requires fixed_subset=0")
     image_manifest_dir = manifest_dir
-    video_manifest_dir = Path(video_manifest_dir_text) if video_manifest_dir_text else (
-        manifest_dir if task == "video" else None
+    video_manifest_dirs = (
+        [Path(part.strip()) for part in video_manifest_dir_text.split(",") if part.strip()]
+        if video_manifest_dir_text
+        else ([manifest_dir] if task == "video" else [])
     )
+    video_manifest_dir = video_manifest_dirs[0] if video_manifest_dirs else None
     if mixed and video_manifest_dir is None:
         raise ValueError("mixed training requires --video-manifest-dir")
     image_loader = _image_sample
@@ -733,34 +761,34 @@ def _run(
         train_positives = train_positives[:fixed_subset]
         print(f"[train] fixed-subset overfit on {len(train_positives)} samples", flush=True)
 
-    if video_manifest_dir is not None and (video_manifest_dir / "train.jsonl").exists():
-        video_train_records = [
+    video_train_records = []
+    for vdir in video_manifest_dirs:
+        if not (vdir / "train.jsonl").exists():
+            continue
+        vrecords = [
             json.loads(line)
-            for line in (video_manifest_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (vdir / "train.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        video_train_records = [record for record in video_train_records if record["control_kind"] != "empty_query"]
-        train_positives.extend(record for record in video_train_records if record["control_kind"] == "positive")
-        train_negatives.extend(record for record in video_train_records if record["control_kind"] == "no_object")
+        vrecords = [record for record in vrecords if record["control_kind"] != "empty_query"]
+        train_positives.extend(record for record in vrecords if record["control_kind"] == "positive")
+        train_negatives.extend(record for record in vrecords if record["control_kind"] == "no_object")
+        video_train_records.extend(vrecords)
+        print(f"[train] loaded {len(vrecords)} video records from {vdir}", flush=True)
 
     image_positives = [record for record in train_positives if record["media_type"] == "image"]
     video_positives = [record for record in train_positives if record["media_type"] == "video"]
     image_negatives = [record for record in train_negatives if record["media_type"] == "image"]
     video_negatives = [record for record in train_negatives if record["media_type"] == "video"]
     records_by_id = {record["sample_id"]: record for record in train_records}
-    if video_manifest_dir is not None and (video_manifest_dir / "train.jsonl").exists():
-        records_by_id.update(
-            {
-                record["sample_id"]: record
-                for record in video_train_records
-            }
-        )
+    if video_train_records:
+        records_by_id.update({record["sample_id"]: record for record in video_train_records})
 
     pair_map: Dict[str, str] = {}
-    for pairs_path in (
-        image_manifest_dir / "train.pairs.jsonl",
-        video_manifest_dir / "train.pairs.jsonl" if video_manifest_dir is not None else None,
-    ):
+    pair_paths = [image_manifest_dir / "train.pairs.jsonl"] + [
+        vdir / "train.pairs.jsonl" for vdir in video_manifest_dirs
+    ]
+    for pairs_path in pair_paths:
         if pairs_path is None or not pairs_path.exists():
             continue
         for line in pairs_path.read_text(encoding="utf-8").splitlines():
