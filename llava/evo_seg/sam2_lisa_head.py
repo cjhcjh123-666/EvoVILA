@@ -144,6 +144,9 @@ class Sam2LisaHead(nn.Module):
         the (optionally trainable) SAM2 memory encoder + memory attention.  This
         teaches temporal consistency and propagation directly in the training
         loop (GLUS/Sa2VA-style) instead of relying on post-hoc eval propagation.
+
+        NOTE: SAM2's MemoryAttention expects seq-first [S, B, C] tensors; we
+        follow the same layout as SAM2Base._prepare_memory_conditioned_features.
         """
 
         batch_size, frames, channels, height, width = image_features.shape
@@ -153,8 +156,8 @@ class Sam2LisaHead(nn.Module):
             batch_size, 1, height, width, device=image_features.device, dtype=torch.float32
         )
         valid = frame_mask.to(device=image_features.device)
-        # per-frame spatial pos enc for the memory attention (reuse SAM2's learned pe)
-        curr_pos = self.image_pe.to(dtype=torch.float32).flatten(2).permute(0, 2, 1)  # [1, HW, C]
+        # per-frame spatial pos enc (seq-first) for the memory attention
+        curr_pos = self.image_pe.to(dtype=torch.float32).flatten(2).permute(2, 0, 1)  # [HW, 1, C]
         memory: list = []
         per_frame_masks = []
         for frame_index in range(frames):
@@ -167,28 +170,33 @@ class Sam2LisaHead(nn.Module):
             pix_feat = image_features[:, frame_index].to(dtype=torch.float32)  # [B, C, H, W]
             if memory and memory_attention is not None:
                 # memories: M x {"vision_features": [B,C,H,W], "vision_pos_enc": [[B,C,H,W]]}
+                m_count = len(memory)
                 mem_feats = torch.stack([m["vision_features"] for m in memory])  # [M,B,C,H,W]
-                mem_feats = mem_feats.permute(1, 0, 2, 3, 4).reshape(batch_size, len(memory), channels, -1)
-                mem_feats = mem_feats.permute(0, 3, 1, 2).reshape(batch_size, -1, channels)  # [B, M*HW, C]
+                mem_feats = mem_feats.permute(1, 0, 2, 3, 4).reshape(batch_size, m_count, channels, -1)
+                mem_feats = mem_feats.permute(0, 3, 1, 2).reshape(batch_size, m_count * height * width, channels)
+                mem_feats = mem_feats.permute(1, 0, 2)  # [M*HW, B, C]
                 mem_pos = torch.stack([m["vision_pos_enc"][-1] for m in memory])  # [M,B,C,H,W]
-                mem_pos = mem_pos.permute(1, 0, 2, 3, 4).reshape(batch_size, len(memory), channels, -1)
-                mem_pos = mem_pos.permute(0, 3, 1, 2).reshape(batch_size, -1, channels)
+                mem_pos = mem_pos.permute(1, 0, 2, 3, 4).reshape(batch_size, m_count, channels, -1)
+                mem_pos = mem_pos.permute(0, 3, 1, 2).reshape(batch_size, m_count * height * width, channels)
                 if maskmem_tpos_enc is not None:
                     tpos = maskmem_tpos_enc.to(dtype=torch.float32)  # [num_maskmem, C]
-                    offsets = torch.arange(len(memory), device=mem_pos.device)
-                    tpos_sel = tpos[offsets]  # [M, C]
-                    hw = height * width
-                    tpos_b = tpos_sel.view(1, len(memory), 1, -1).repeat(batch_size, 1, hw, 1)
-                    mem_pos = mem_pos + tpos_b.view(batch_size, -1, tpos_sel.shape[-1])
-                curr = pix_feat.flatten(2).permute(0, 2, 1)  # [B, HW, C]
+                    # memory[0] is the oldest; give older frames a higher tpos index
+                    offsets = torch.arange(m_count, device=mem_pos.device)
+                    tpos_idx = ((m_count - 1 - offsets) % tpos.shape[0]).long()
+                    tpos_sel = tpos[tpos_idx]  # [M, C]
+                    tpos_b = tpos_sel.view(m_count, 1, channels).repeat(1, height * width, 1)
+                    tpos_b = tpos_b.view(m_count * height * width, 1, channels).expand(-1, batch_size, -1)
+                    mem_pos = mem_pos + tpos_b
+                mem_pos = mem_pos.permute(1, 0, 2)  # [M*HW, B, C]
+                curr = pix_feat.flatten(2).permute(2, 0, 1)  # [HW, B, C]
                 fused = memory_attention(
                     curr=curr,
                     memory=mem_feats,
-                    curr_pos=curr_pos.expand(batch_size, -1, -1),
+                    curr_pos=curr_pos.expand(-1, batch_size, -1),
                     memory_pos=mem_pos,
                     num_obj_ptr_tokens=0,
                 )
-                pix_feat = fused.permute(0, 2, 1).view(batch_size, channels, height, width)
+                pix_feat = fused.permute(1, 2, 0).view(batch_size, channels, height, width)
             frame_masks, _, _, _ = self.sam_mask_decoder(
                 image_embeddings=pix_feat,
                 image_pe=self.image_pe.to(dtype=torch.float32),
