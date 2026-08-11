@@ -108,6 +108,36 @@ def _upsample_dense(dense: DenseFeatureBatch, scale: int) -> DenseFeatureBatch:
     )
 
 
+class _CyclicPool:
+    """Epoch-cycling sampler: shuffle once, walk the full pool, reshuffle.
+
+    Guarantees every training record is seen exactly once per epoch (full data
+    coverage), instead of the legacy random-with-replacement draw that only
+    ever touches a fraction of the manifest in a fixed step budget.
+    """
+
+    def __init__(self, records, rng) -> None:
+        self.records = [record for record in records]
+        self.rng = rng
+        self._index = 0
+        self._shuffle()
+
+    @property
+    def size(self) -> int:
+        return len(self.records)
+
+    def _shuffle(self) -> None:
+        self.rng.shuffle(self.records)
+
+    def next(self):
+        if self._index >= len(self.records):
+            self._shuffle()
+            self._index = 0
+        record = self.records[self._index]
+        self._index += 1
+        return record
+
+
 def _setup_distributed(device_text: str) -> Tuple[torch.device, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     if local_rank >= 0:
@@ -485,11 +515,14 @@ def _run(
     no_object_image_manifest: Optional[Path] = None,
     resume: bool = False,
     wandb_project: Optional[str] = None,
+    seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     device, rank, world_size = _setup_distributed(device_text)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("S4b training requires an available CUDA device")
     seed = int(config.get("seed", 0))
+    if seed_override is not None:
+        seed = int(seed_override)
     seed = seed + rank
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -740,6 +773,17 @@ def _run(
     print(f"[train] pools image_pos={len(image_positives)} video_pos={len(video_positives)} "
           f"image_neg={len(image_negatives)} video_neg={len(video_negatives)} "
           f"pairs={len(pair_map) // 2}", flush=True)
+    if epoch_cycle:
+        train_pos_cyc = _CyclicPool(train_positives, rng)
+        train_neg_cyc = _CyclicPool(train_negatives, rng)
+        image_pos_cyc = _CyclicPool(image_positives, rng)
+        image_neg_cyc = _CyclicPool(image_negatives, rng)
+        video_pos_cyc = _CyclicPool(video_positives, rng)
+        video_neg_cyc = _CyclicPool(video_negatives, rng)
+    else:
+        train_pos_cyc = train_neg_cyc = None
+        image_pos_cyc = image_neg_cyc = None
+        video_pos_cyc = video_neg_cyc = None
 
     steps = int(training.get("steps", 500))
     log_every = int(training.get("log_every", 10))
@@ -752,6 +796,8 @@ def _run(
     mix_video_ratio = float(training.get("mix_video_ratio", 0.5))
     no_object_ratio = float(training.get("no_object_ratio", 0.15))
     swap_prob = float(training.get("swap_prob", 0.25))
+    grad_accum = max(1, int(training.get("grad_accum", 1)))
+    epoch_cycle = bool(training.get("epoch_cycle", False))
     swap_weight = float(loss_weights.get("query_swap", 0.0))
     seg_loss_weights = dict(loss_weights)
     seg_loss_weights.pop("query_swap", None)
@@ -863,88 +909,139 @@ def _run(
     if start_step > 0:
         progress.update(start_step)
     while step < steps:
-        if mixed:
-            if rng.random() < mix_video_ratio:
-                sample_task, pos_pool, neg_pool = "video", video_positives, video_negatives
+        accum_loss = 0.0
+        accum_bce = 0.0
+        accum_dice = 0.0
+        accum_objectness = 0.0
+        accum_temporal = 0.0
+        accum_swap = 0.0
+        accum_iou = 0.0
+        micro_done = 0
+        skips_in_row = 0
+        last_record = None
+        last_sample_task = "image"
+        while micro_done < grad_accum and step < steps:
+            if epoch_cycle:
+                if mixed:
+                    if rng.random() < mix_video_ratio:
+                        sample_task, pos_pool, neg_pool = "video", video_pos_cyc, video_neg_cyc
+                    else:
+                        sample_task, pos_pool, neg_pool = "image", image_pos_cyc, image_neg_cyc
+                    if neg_pool is not None and neg_pool.size and rng.random() < no_object_ratio:
+                        record = neg_pool.next()
+                    else:
+                        record = pos_pool.next()
+                else:
+                    sample_task = task
+                    pos_pool = train_pos_cyc
+                    neg_pool = train_neg_cyc
+                    if neg_pool is not None and neg_pool.size and rng.random() < no_object_ratio:
+                        record = neg_pool.next()
+                    else:
+                        record = pos_pool.next()
+            elif mixed:
+                if rng.random() < mix_video_ratio:
+                    sample_task, pos_pool, neg_pool = "video", video_positives, video_negatives
+                else:
+                    sample_task, pos_pool, neg_pool = "image", image_positives, image_negatives
+                if neg_pool and rng.random() < no_object_ratio:
+                    record = rng.choice(neg_pool)
+                else:
+                    record = rng.choice(pos_pool)
             else:
-                sample_task, pos_pool, neg_pool = "image", image_positives, image_negatives
-            if neg_pool and rng.random() < no_object_ratio:
-                record = rng.choice(neg_pool)
-            else:
-                record = rng.choice(pos_pool)
-        else:
-            sample_task = task
-            if fixed_subset > 0:
-                record = train_positives[(step * world_size + rank) % len(train_positives)]
-            elif train_negatives and rng.random() < no_object_ratio:
-                record = rng.choice(train_negatives)
-            else:
-                record = rng.choice(train_positives)
-        loader = video_loader if sample_task == "video" else image_loader
-        sample = loader(record, model, tokenizer, template, seg_id, device)
-        decoder.train()
-        projector.train()
-        swap_value = 0.0
-        try:
-            with seg_training_active(True):
-                result, losses, batch = run_forward(sample, sample_task)
-                total_loss = losses["total"]
-                if not torch.isfinite(total_loss):
-                    raise ValueError("non-finite total loss")
-                if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
-                    anchor_rgb = RGBFrameBatch(
-                        frames=sample["rgb"].frames[:, :1],
-                        frame_mask=torch.ones(1, 1, dtype=torch.bool),
-                        sample_ids=(sample["sample_id"],),
-                    )
-                    refined = _sam2_refine_trainable(
-                        provider, anchor_rgb, result.mask_logits[:, :, :1], device
-                    )
-                    refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
-                    refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
-                    refined_loss = (
-                        binary_mask_loss(refined, refined_target, refined_valid)
-                        + dice_loss(refined, refined_target, refined_valid)
-                    ) * refined_weight
-                    total_loss = total_loss + refined_loss
-                if (
-                    swap_weight > 0
-                    and record["control_kind"] == "positive"
-                    and rng.random() < swap_prob
-                ):
-                    partner_id = pair_map.get(record["sample_id"])
-                    partner = records_by_id.get(partner_id) if partner_id else None
-                    if partner is not None:
-                        swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
-                        swapped_result, _, _ = run_forward(swapped_sample, sample_task)
-                        valid_swap = batch.frame_mask[:, None, :]
-                        if batch.target_presence is not None:
-                            valid_swap = batch.target_presence & valid_swap
-                        swap_loss = query_swap_margin_loss(
-                            result.mask_logits,
-                            swapped_result.mask_logits,
-                            batch.target_masks,
-                            valid_swap,
-                            margin=float(training.get("swap_margin", 0.1)),
+                sample_task = task
+                if fixed_subset > 0:
+                    record = train_positives[(step * world_size + rank) % len(train_positives)]
+                elif train_negatives and rng.random() < no_object_ratio:
+                    record = rng.choice(train_negatives)
+                else:
+                    record = rng.choice(train_positives)
+            loader = video_loader if sample_task == "video" else image_loader
+            sample = loader(record, model, tokenizer, template, seg_id, device)
+            decoder.train()
+            projector.train()
+            swap_value = 0.0
+            try:
+                with seg_training_active(True):
+                    result, losses, batch = run_forward(sample, sample_task)
+                    total_loss = losses["total"]
+                    if not torch.isfinite(total_loss):
+                        raise ValueError("non-finite total loss")
+                    if sam2_mask_decoder_trainable and record["control_kind"] == "positive":
+                        anchor_rgb = RGBFrameBatch(
+                            frames=sample["rgb"].frames[:, :1],
+                            frame_mask=torch.ones(1, 1, dtype=torch.bool),
+                            sample_ids=(sample["sample_id"],),
                         )
-                        total_loss = total_loss + swap_loss * swap_weight
-                        swap_value = float(swap_loss.detach().item())
-        except (ValueError, RuntimeError) as error:
-            message = str(error)
-            if (
-                "must contain only finite values" not in message
-                and "Sizes of tensors must match" not in message
-                and "non-finite total loss" not in message
-            ):
-                raise
-            if logger is not None:
-                logger.message(
-                    f"step {step} SKIPPED bad sample {record['sample_id']} ({sample_task}): {message[:120]}"
-                )
+                        refined = _sam2_refine_trainable(
+                            provider, anchor_rgb, result.mask_logits[:, :, :1], device
+                        )
+                        refined_target = _align_targets_for_refine(sample["target_mask"][:, :, :1], refined, device)
+                        refined_valid = torch.ones(1, 1, 1, dtype=torch.bool, device=device)
+                        refined_loss = (
+                            binary_mask_loss(refined, refined_target, refined_valid)
+                            + dice_loss(refined, refined_target, refined_valid)
+                        ) * refined_weight
+                        total_loss = total_loss + refined_loss
+                    if (
+                        swap_weight > 0
+                        and record["control_kind"] == "positive"
+                        and rng.random() < swap_prob
+                    ):
+                        partner_id = pair_map.get(record["sample_id"])
+                        partner = records_by_id.get(partner_id) if partner_id else None
+                        if partner is not None:
+                            swapped_sample = loader(partner, model, tokenizer, template, seg_id, device)
+                            swapped_result, _, _ = run_forward(swapped_sample, sample_task)
+                            valid_swap = batch.frame_mask[:, None, :]
+                            if batch.target_presence is not None:
+                                valid_swap = batch.target_presence & valid_swap
+                            swap_loss = query_swap_margin_loss(
+                                result.mask_logits,
+                                swapped_result.mask_logits,
+                                batch.target_masks,
+                                valid_swap,
+                                margin=float(training.get("swap_margin", 0.1)),
+                            )
+                            total_loss = total_loss + swap_loss * swap_weight
+                            swap_value = float(swap_loss.detach().item())
+            except (ValueError, RuntimeError) as error:
+                message = str(error)
+                if (
+                    "must contain only finite values" not in message
+                    and "Sizes of tensors must match" not in message
+                    and "non-finite total loss" not in message
+                ):
+                    raise
+                skips_in_row += 1
+                if skips_in_row > 200:
+                    raise RuntimeError(f"too many consecutive skipped samples: {message[:200]}")
+                if logger is not None:
+                    logger.message(
+                        f"step {step} SKIPPED bad sample {record['sample_id']} ({sample_task}): {message[:120]}"
+                    )
+                continue
+            skips_in_row = 0
+            (total_loss / grad_accum).backward()
+            micro_done += 1
+            last_record = record
+            last_sample_task = sample_task
+            accum_loss += float(total_loss.detach().item())
+            accum_bce += float(losses["bce"].detach().item())
+            accum_dice += float(losses["dice"].detach().item())
+            accum_objectness += float(losses["objectness"].detach().item())
+            accum_temporal += float(losses["temporal"].detach().item())
+            accum_swap += swap_value
+            accum_iou += _mask_iou(
+                result.mask_logits[0, 0, 0].detach(),
+                sample["target_mask"][0, 0, 0].detach()
+                if record["control_kind"] == "positive"
+                else torch.zeros(1, 1, dtype=torch.bool, device=device),
+            )
+        if micro_done == 0:
             step += 1
             progress.update(1)
             continue
-        total_loss.backward()
         _sync_gradients(optimizer, world_size)
         param_names = {id(parameter): name for name, parameter in model.named_parameters()}
         nan_grads = [
@@ -978,32 +1075,30 @@ def _run(
             if logger is not None:
                 logger.message(f"step {step} NON-FINITE params: {nan_params[:5]}")
 
-        anchor_iou = _mask_iou(
-            result.mask_logits[0, 0, 0].detach(),
-            sample["target_mask"][0, 0, 0].detach()
-            if record["control_kind"] == "positive"
-            else torch.zeros(1, 1, dtype=torch.bool, device=device),
-        )
+        record = last_record
+        sample_task = last_sample_task
+        anchor_iou = accum_iou / max(1, micro_done)
         progress.update(1)
         progress.set_postfix(
-            loss=float(total_loss.detach().item()),
+            loss=accum_loss / max(1, micro_done),
             iou=anchor_iou,
-            bce=float(losses["bce"].detach().item()),
-            dice=float(losses["dice"].detach().item()),
-            swap=swap_value,
+            bce=accum_bce / max(1, micro_done),
+            dice=accum_dice / max(1, micro_done),
+            swap=accum_swap / max(1, micro_done),
         )
         history_entry = {
             "step": step,
             "source": sample_task,
-            "loss": float(total_loss.detach().item()),
-            "bce": float(losses["bce"].detach().item()),
-            "dice": float(losses["dice"].detach().item()),
-            "objectness": float(losses["objectness"].detach().item()),
-            "temporal": float(losses["temporal"].detach().item()),
-            "swap": swap_value,
+            "loss": accum_loss / max(1, micro_done),
+            "bce": accum_bce / max(1, micro_done),
+            "dice": accum_dice / max(1, micro_done),
+            "objectness": accum_objectness / max(1, micro_done),
+            "temporal": accum_temporal / max(1, micro_done),
+            "swap": accum_swap / max(1, micro_done),
             "anchor_iou": anchor_iou,
             "control_kind": record["control_kind"],
             "sample_id": record["sample_id"],
+            "micro_batches": micro_done,
         }
         if rank == 0:
             history.append(history_entry)
@@ -1223,6 +1318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="enable torch.autograd.set_detect_anomaly to trace the first non-finite gradient",
     )
     parser.add_argument("--wandb-project", default=None, help="optional wandb project name for live curves")
+    parser.add_argument("--seed", type=int, default=None, help="override config seed (useful for parallel per-GPU runs)")
     args = parser.parse_args(argv)
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
@@ -1253,6 +1349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         resume=args.resume,
         wandb_project=args.wandb_project,
+        seed_override=args.seed,
     )
     return 0
 
