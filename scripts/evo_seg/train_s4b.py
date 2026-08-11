@@ -495,6 +495,7 @@ def _run(
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
+    torch.cuda.init()  # ensure a CUDA context exists before querying memory stats
     torch.cuda.reset_peak_memory_stats(device)
 
     import llava
@@ -603,7 +604,12 @@ def _run(
         mask_decoder = provider._predictor.model.sam_mask_decoder
         for parameter in mask_decoder.parameters():
             parameter.requires_grad_(True)
-            sam2_mask_decoder_params.append(parameter)
+        # The LISA head owns sam_mask_decoder as a submodule (Sam2LisaHead),
+        # so decoder.parameters() already includes the mask decoder.  Adding
+        # it again to a separate optimizer group would double-update it every
+        # step; only the standalone (query-decoder) head needs its own group.
+        if str(config.get("head", "query_decoder")) != "lisa":
+            sam2_mask_decoder_params.extend(mask_decoder.parameters())
 
     capability = SegmentationCapability(decoder)
     adapter = VILASegmentationAdapter(model, provider, capability)
