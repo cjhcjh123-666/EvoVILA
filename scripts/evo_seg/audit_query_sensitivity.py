@@ -194,11 +194,13 @@ def main(argv=None) -> int:
             )
         return (
             projected.detach().float().cpu(),
+            query_states.states.detach().float().cpu(),
             result.mask_logits.detach().float().cpu(),
             sample["target_mask"][0, 0, 0].detach().cpu(),
         )
 
     same_cos, cross_cos = [], []
+    raw_cos = []
     same_mask_overlap, swapped_mask_overlap = [], []
     pair_records = []
     for pair in pairs:
@@ -209,8 +211,8 @@ def main(argv=None) -> int:
         if left is None or right is None or left.get("media_id") != right.get("media_id"):
             continue
         try:
-            qa, mask_a, gt_a = forward_record(left)
-            qb, mask_b, gt_b = forward_record(right)
+            qa, raw_a, mask_a, gt_a = forward_record(left)
+            qb, raw_b, mask_b, gt_b = forward_record(right)
         except Exception as error:  # noqa: BLE001
             print(f"pair {left_id}/{right_id} failed: {error}", flush=True)
             continue
@@ -219,6 +221,10 @@ def main(argv=None) -> int:
         va = qa.mean(dim=1).squeeze(0)
         vb = qb.mean(dim=1).squeeze(0)
         same_cos.append(float(F.cosine_similarity(va[None], vb[None]).item()))
+        # raw VILA query-state cosine (before the projector)
+        ra = raw_a.mean(dim=1).squeeze(0)
+        rb = raw_b.mean(dim=1).squeeze(0)
+        raw_cos.append(float(F.cosine_similarity(ra[None], rb[None]).item()))
         # same-image mask overlap (a's mask vs b's mask)
         sa = (mask_a[0, 0, 0].sigmoid() > 0.5)
         sb = (mask_b[0, 0, 0].sigmoid() > 0.5)
@@ -245,6 +251,7 @@ def main(argv=None) -> int:
     report = {
         "query_state_cosine": {
             "same_image_different_query": summary(same_cos),
+            "raw_vila_states_before_projector": summary(raw_cos),
             "interpretation": (
                 "near 1.0 => query representation collapses (image-prior); "
                 "low => queries are discriminative"
