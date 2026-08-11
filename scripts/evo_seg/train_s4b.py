@@ -776,6 +776,14 @@ def _run(
         return result, losses, batch
 
     logger = TrainingLogger(output_dir) if rank == 0 else None
+    tb_writer = None
+    if rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+        except Exception:  # tensorboard is an optional dependency
+            tb_writer = None
     history: List[Dict[str, Any]] = []
     history_file = output_dir / "train_history.jsonl"
     if rank == 0:
@@ -943,24 +951,35 @@ def _run(
             history.append(history_entry)
             with history_file.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(history_entry) + "\n")
-            remaining = progress.format_dict.get("remaining")
-            logger.step(
-                step=step,
-                total=steps,
-                source=sample_task,
-                sample=record["sample_id"],
-                kind=record["control_kind"],
-                loss=round(history_entry["loss"], 4),
-                bce=round(history_entry["bce"], 4),
-                dice=round(history_entry["dice"], 4),
-                objectness=round(history_entry["objectness"], 4),
-                temporal=round(history_entry["temporal"], 4),
-                swap=round(history_entry["swap"], 4),
-                iou=round(anchor_iou, 3),
-                lr=optimizer.param_groups[0]["lr"],
-                gnorm=round(grad_norm, 3),
-                eta=remaining,
-            )
+            if step % log_every == 0 or step == steps - 1:
+                remaining = progress.format_dict.get("remaining")
+                logger.step(
+                    step=step,
+                    total=steps,
+                    source=sample_task,
+                    sample=record["sample_id"],
+                    kind=record["control_kind"],
+                    loss=round(history_entry["loss"], 4),
+                    bce=round(history_entry["bce"], 4),
+                    dice=round(history_entry["dice"], 4),
+                    objectness=round(history_entry["objectness"], 4),
+                    temporal=round(history_entry["temporal"], 4),
+                    swap=round(history_entry["swap"], 4),
+                    iou=round(anchor_iou, 3),
+                    lr=optimizer.param_groups[0]["lr"],
+                    gnorm=round(grad_norm, 3),
+                    eta=remaining,
+                )
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss", history_entry["loss"], step)
+                    tb_writer.add_scalar("train/iou", anchor_iou, step)
+                    tb_writer.add_scalar("train/bce", history_entry["bce"], step)
+                    tb_writer.add_scalar("train/dice", history_entry["dice"], step)
+                    tb_writer.add_scalar("train/objectness", history_entry["objectness"], step)
+                    tb_writer.add_scalar("train/temporal", history_entry["temporal"], step)
+                    tb_writer.add_scalar("train/swap", history_entry["swap"], step)
+                    tb_writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], step)
+                    tb_writer.add_scalar("train/grad_norm", grad_norm, step)
         if rank == 0 and (step % eval_every == 0 or step == steps - 1):
             for eval_task, eval_dir, eval_loader in (
                 ("image", image_manifest_dir, image_loader),
@@ -996,6 +1015,8 @@ def _run(
                     f"eval step={step} task={eval_task} val_iou={val_iou:.4f} n={len(ious)}"
                 )
                 history_entry.setdefault("eval", {})[eval_task] = round(val_iou, 4)
+                if tb_writer is not None:
+                    tb_writer.add_scalar(f"eval/val_iou_{eval_task}", val_iou, step)
         step += 1
         if rank == 0 and save_every > 0 and step % save_every == 0:
             periodic = {
@@ -1088,6 +1109,8 @@ def _run(
             "sam2_initialization_ms": sam2_initialization_ms,
         }
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        if tb_writer is not None:
+            tb_writer.close()
         return summary
     return {}
 

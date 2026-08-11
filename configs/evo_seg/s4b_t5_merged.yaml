@@ -7,7 +7,7 @@ training:
   lora_lr: 4.0e-4
   weight_decay: 0.0
   grad_clip: 1.0
-  log_every: 20
+  log_every: 100
   eval_every: 500
   save_every: 1000
   hidden_layer: -1
