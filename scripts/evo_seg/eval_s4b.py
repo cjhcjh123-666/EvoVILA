@@ -131,8 +131,9 @@ def _eval_image_record(
             seg_state = torch.nan_to_num(seg_state, nan=0.0, posinf=0.0, neginf=0.0)
             seg_state = seg_state[torch.arange(seg_state.shape[0], device=device), seg_positions]
             dense = provider.encode_frames(sample["rgb"])
-            result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
-            refined = result.mask_logits.detach()
+            with torch.autocast(device_type="cuda", enabled=False):
+                result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
+            refined = result.mask_logits.detach().to(dtype=torch.float32)
         else:
             projected = projector(query_states.states, query_states.mask, seg_positions)
             dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
@@ -189,8 +190,9 @@ def _eval_video_record(
             seg_state = query_states.states.to(dtype=torch.float32)
             seg_state = torch.nan_to_num(seg_state, nan=0.0, posinf=0.0, neginf=0.0)
             seg_state = seg_state[torch.arange(seg_state.shape[0], device=device), seg_positions]
-            result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
-            refined_anchor = result.mask_logits[:, :, :1][0, :, 0]  # [N,H,W]
+            with torch.autocast(device_type="cuda", enabled=False):
+                result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
+            refined_anchor = result.mask_logits[:, :, :1][0, :, 0].to(dtype=torch.float32)  # [N,H,W]
         else:
             projected = projector(query_states.states, query_states.mask, seg_positions)
             result = capability(

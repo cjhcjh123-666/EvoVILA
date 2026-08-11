@@ -95,7 +95,8 @@ def _forward_image(
             seg_state = torch.nan_to_num(seg_state, nan=0.0, posinf=0.0, neginf=0.0)
             seg_state = seg_state[torch.arange(seg_state.shape[0], device=device), seg_positions]
             dense = provider.encode_frames(sample["rgb"])
-            result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
+            with torch.autocast(device_type="cuda", enabled=False):
+                result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
         else:
             projected = projector(query_states.states, query_states.mask, seg_positions)
             dense = _upsample_dense(provider.encode_frames(sample["rgb"]), spatial_scale)
