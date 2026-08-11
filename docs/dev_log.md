@@ -511,3 +511,19 @@ CUDA_VISIBLE_DEVICES=0 python scripts/evo_seg/smoke_video_segmentation.py \
   image_pos=321,327 / video_pos=6,345 / image_neg=167,658 / video_neg=3,438 / pairs=46,998。
   稳态 ~2.25s/it（节点负载 ~300 导致慢于 T4 的 0.6s/step），ETA ~6h。这是论文要写的
   anti-shortcut 主模型：全量三个图集 + 系统负样本 + query-swap。
+
+### 2026-08-11 — S4b T5 NaN 根因定位与 bf16 修复（关键）
+
+- **症状**：T5 训练（s4b_t5_merged.yaml）从 step 2337 起间歇 NaN 梯度，~step 5594 起每步
+  NON-FINITE 导致 optimizer 被跳过、参数冻结在 ~5586；且 NaN 跳过路径 `continue` 绕过
+  checkpoint 保存，6000 步 checkpoint 未落盘。
+- **定位**：`--detect-anomaly` + 从 step-4000 checkpoint resume 在 step 4001（no-object 样本）
+  复现，traceback 指向 Llama 最终 RMSNorm `hidden_states * rsqrt(variance + eps)` 的
+  `MulBackward0` 返回 NaN。机制：VILA 残差流在 fp16（max ~65504）下对某些样本溢出成 Inf，
+  `variance=Inf` → `rsqrt=0` → `Inf×0=NaN` → 全图梯度 NaN。VILA 的 QuantLinearTE 本来就
+  以 bf16 I/O（FP8 量化），训练/评测却用 fp16 autocast 包裹，既冗余又易溢出。
+- **修复（提交 `bcfab63`）**：train/eval 前向统一 `model.to(bf16)` + `torch.autocast(dtype=bf16)`，
+  视觉输入改 bf16；`losses._masked_mean` 先清零无效项再加权（避免 NaN×0 污染均值）；
+  NaN 梯度日志精确到参数名；新增 `--detect-anomaly` 调试开关。
+- **验证**：resume-4000 复现修复前 step 4001 即 NaN，修复后干净跑过 4225+（含 no-object/swap，
+  0 NON-FINITE）；eval_s4b / eval_antishortcut bf16 冒烟通过（3 样本，指标与 fp16 一致）。
