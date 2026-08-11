@@ -770,6 +770,8 @@ def _run(
             left, right = pair["left_sample_id"], pair["right_sample_id"]
             pair_map[left] = right
             pair_map[right] = left
+    grad_accum = max(1, int(training.get("grad_accum", 1)))
+    epoch_cycle = bool(training.get("epoch_cycle", False))
     print(f"[train] pools image_pos={len(image_positives)} video_pos={len(video_positives)} "
           f"image_neg={len(image_negatives)} video_neg={len(video_negatives)} "
           f"pairs={len(pair_map) // 2}", flush=True)
@@ -796,8 +798,6 @@ def _run(
     mix_video_ratio = float(training.get("mix_video_ratio", 0.5))
     no_object_ratio = float(training.get("no_object_ratio", 0.15))
     swap_prob = float(training.get("swap_prob", 0.25))
-    grad_accum = max(1, int(training.get("grad_accum", 1)))
-    epoch_cycle = bool(training.get("epoch_cycle", False))
     swap_weight = float(loss_weights.get("query_swap", 0.0))
     seg_loss_weights = dict(loss_weights)
     seg_loss_weights.pop("query_swap", None)
