@@ -197,7 +197,7 @@ def main(argv=None) -> int:
                 seg_state = query_states.states.to(dtype=torch.float32)[
                     torch.arange(query_states.states.shape[0], device=device), seg_positions
                 ]
-                result = decoder(seg_state, dense.features[:, 0], dense.frame_mask, dense.high_res_features)
+                result = decoder(seg_state, dense.features, dense.frame_mask, dense.high_res_features)
                 projected = seg_state.detach().float().cpu().unsqueeze(1)
             else:
                 projected = projector(

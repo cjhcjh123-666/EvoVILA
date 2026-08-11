@@ -65,8 +65,8 @@ class Sam2LisaHead(nn.Module):
 
         Args:
             seg_state: [B, D] fp32 hidden state of the [SEG] token.
-            image_features: [B, C, H, W] frozen SAM2 image embeddings.
-            frame_mask: [B, 1] valid-frame mask (image task: all valid).
+            image_features: [B, T, C, H, W] frozen SAM2 image embeddings.
+            frame_mask: [B, T] valid-frame mask.
         """
 
         batch_size = seg_state.shape[0]
@@ -74,7 +74,9 @@ class Sam2LisaHead(nn.Module):
         object_logits = self.object_head(self.object_norm(seg_state))  # [B, 1]
 
         features = image_features.to(dtype=torch.float32)
-        height, width = features.shape[-2:]
+        if features.ndim != 5:
+            raise ValueError("image_features must have shape [B,T,C,H,W]")
+        batch_size, frames, _, height, width = features.shape
         dense = torch.zeros(
             batch_size,
             1,
@@ -83,23 +85,33 @@ class Sam2LisaHead(nn.Module):
             device=features.device,
             dtype=torch.float32,
         )
-        masks, _, _, _ = self.sam_mask_decoder(
-            image_embeddings=features,
-            image_pe=self.image_pe.to(dtype=torch.float32),
-            sparse_prompt_embeddings=prompt.unsqueeze(1),  # [B, 1, 256]
-            dense_prompt_embeddings=dense,
-            multimask_output=False,
-            repeat_image=False,
-            high_res_features=(
-                [level[:, 0].to(dtype=torch.float32) for level in high_res_features]
-                if high_res_features
-                else None
-            ),
-        )
-        # masks: [B, 1, H_out, W_out] at 4x the image-embedding resolution.
-        mask_logits = masks.unsqueeze(2)  # [B, 1, 1, H, W]
+        valid = frame_mask.to(device=features.device)
+        per_frame_masks = []
+        for frame_index in range(frames):
+            if bool(valid[:, frame_index].all()):
+                frame_masks, _, _, _ = self.sam_mask_decoder(
+                    image_embeddings=features[:, frame_index],
+                    image_pe=self.image_pe.to(dtype=torch.float32),
+                    sparse_prompt_embeddings=prompt.unsqueeze(1),  # [B, 1, 256]
+                    dense_prompt_embeddings=dense,
+                    multimask_output=False,
+                    repeat_image=False,
+                    high_res_features=(
+                        [level[:, frame_index].to(dtype=torch.float32) for level in high_res_features]
+                        if high_res_features
+                        else None
+                    ),
+                )
+                per_frame_masks.append(frame_masks.unsqueeze(2))  # [B, 1, 1, H, W]
+            else:
+                height_out, width_out = dense.shape[-2] * 4, dense.shape[-1] * 4
+                per_frame_masks.append(
+                    features.new_zeros(batch_size, 1, 1, height_out, width_out)
+                )
+        mask_logits = torch.cat(per_frame_masks, dim=2)  # [B, 1, T, H, W]
+        mask_logits = mask_logits * valid[:, None, :, None, None].to(dtype=mask_logits.dtype)
         frame_embeddings = seg_state.unsqueeze(1).unsqueeze(1).expand(
-            batch_size, 1, 1, -1
+            batch_size, 1, frames, -1
         )
         return SegmentationResult(
             mask_logits=mask_logits,

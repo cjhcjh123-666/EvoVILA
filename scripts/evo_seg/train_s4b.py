@@ -774,7 +774,7 @@ def _run(
             ]
             result = decoder(
                 seg_state,
-                dense.features[:, 0],
+                dense.features,
                 dense.frame_mask,
                 dense.high_res_features,
             )
